@@ -20,6 +20,9 @@ def migrate():
         user_columns={c['name'] for c in inspect(connection).get_columns('users')}
         for field,kind,default in [('avatar_url','TEXT',"''"),('bio','TEXT',"''"),('company','VARCHAR',"''"),('google_sub','VARCHAR','NULL')]:
             if field not in user_columns: connection.execute(text(f'ALTER TABLE users ADD COLUMN {field} {kind} DEFAULT {default}'))
+        if 'is_active' not in user_columns: connection.execute(text('ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1'))
+        if 'razorpay_subscription_id' not in user_columns: connection.execute(text('ALTER TABLE users ADD COLUMN razorpay_subscription_id VARCHAR'))
+        if 'billing_provider' not in user_columns: connection.execute(text("ALTER TABLE users ADD COLUMN billing_provider VARCHAR NOT NULL DEFAULT 'stripe'"))
         conversation_columns={c['name'] for c in inspect(connection).get_columns('conversations')}
         if 'workflow_state' not in conversation_columns:
             connection.execute(text("ALTER TABLE conversations ADD COLUMN workflow_state JSON DEFAULT '{}'"))
@@ -29,7 +32,9 @@ def migrate():
             connection.execute(text("CREATE INDEX IF NOT EXISTS chunks_search_gin ON chunks USING gin (to_tsvector('english', content))"))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (1) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (2) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (3) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (4) ON CONFLICT (version) DO NOTHING'))
 
 if __name__ == '__main__':
     migrate()
-    print('AgentForge schema version 1 applied.')
+    print('AgentForge schema version 4 applied.')

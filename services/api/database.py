@@ -35,8 +35,11 @@ class User(Base):
     name = Column(String, nullable=False)
     password = Column(String, nullable=False)
     plan = Column(String, default='free', nullable=False)
+    is_active = Column(Integer, default=1, nullable=False)
     stripe_customer_id = Column(String, nullable=True)
     subscription_id = Column(String, nullable=True)
+    razorpay_subscription_id = Column(String, nullable=True)
+    billing_provider = Column(String, default='stripe', nullable=False)
     avatar_url = Column(Text, default='')
     bio = Column(Text, default='')
     company = Column(String, default='')
@@ -149,6 +152,22 @@ class WebhookEvent(Base):
     __tablename__ = 'webhook_events'
     id = Column(String, primary_key=True)
     created_at = Column(String, default=now)
+
+class AdminAudit(Base):
+    __tablename__ = 'admin_audit'
+    id = Column(String, primary_key=True, default=uid)
+    actor_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    action = Column(String, nullable=False)
+    entity_type = Column(String, nullable=False)
+    entity_id = Column(String, nullable=False)
+    details = Column(JSON, default=dict)
+    created_at = Column(String, default=now, index=True)
+
+class AppSetting(Base):
+    __tablename__ = 'app_settings'
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
 
 class Workflow(Base):
     __tablename__ = 'workflows'

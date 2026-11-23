@@ -14,7 +14,7 @@ WEB_ORIGIN = os.getenv('WEB_ORIGIN', 'http://localhost:3000')
 PUBLIC_WEB_URL = os.getenv('PUBLIC_WEB_URL', WEB_ORIGIN)
 PRODUCTION = os.getenv('APP_ENV') == 'production'
 PLANS = {
-    'free': {'bots': 2, 'documents': 10, 'messages': 100},
+    'free': {'bots': 1, 'documents': 10, 'messages': 100},
     'pro': {'bots': 10, 'documents': 100, 'messages': 5000},
     'team': {'bots': 50, 'documents': 500, 'messages': 25000},
 }

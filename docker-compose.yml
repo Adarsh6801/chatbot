@@ -2,6 +2,7 @@ services:
   redis:
     image: redis:7-alpine
     command: [redis-server, --appendonly, 'yes']
+    ports: ["127.0.0.1:6379:6379"]
     volumes: [redis_data:/data]
     healthcheck:
       test: [CMD, redis-cli, ping]
@@ -10,6 +11,7 @@ services:
       retries: 10
   postgres:
     image: pgvector/pgvector:pg16
+    ports: ["127.0.0.1:15432:5432"]
     environment:
       POSTGRES_USER: agentforge
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-only}
@@ -29,8 +31,10 @@ services:
     environment: &api_environment
       DATABASE_URL: postgresql+psycopg://agentforge:${POSTGRES_PASSWORD:-local-development-only}@postgres:5432/agentforge
       WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      ADMIN_WEB_ORIGIN: ${ADMIN_WEB_ORIGIN:-http://localhost:3001}
       PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
       APP_ENV: ${APP_ENV:-development}
+      ADMIN_USER_ID: ${ADMIN_USER_ID:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       COHERE_API_KEY: ${COHERE_API_KEY:-}
@@ -38,6 +42,12 @@ services:
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRO_PRICE_ID: ${STRIPE_PRO_PRICE_ID:-}
       STRIPE_TEAM_PRICE_ID: ${STRIPE_TEAM_PRICE_ID:-}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-stripe}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      RAZORPAY_PRO_PLAN_ID: ${RAZORPAY_PRO_PLAN_ID:-}
+      RAZORPAY_TEAM_PLAN_ID: ${RAZORPAY_TEAM_PLAN_ID:-}
       REDIS_URL: redis://redis:6379/0
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
@@ -82,6 +92,16 @@ services:
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     ports: ["3000:3000"]
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+  admin:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.admin
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports: ["3001:3001"]
     depends_on:
       api: {condition: service_healthy}
     restart: unless-stopped

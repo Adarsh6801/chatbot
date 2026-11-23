@@ -25,9 +25,15 @@ flowchart LR
 
 Requirements: Python 3.11+, Node.js 22+, npm. No paid account or AI key is needed for the local extractive engine.
 
-On Windows, run `powershell -ExecutionPolicy Bypass -File scripts/start.ps1`. It installs dependencies, starts the API, and runs the web app. Press Ctrl+C to stop both.
+On Windows, run `powershell -ExecutionPolicy Bypass -File scripts/start.ps1`. It installs dependencies, starts the API and admin console, and runs the customer web app. Press Ctrl+C to stop the processes.
 
-Or start two terminals from the repository root:
+The customer site has a public landing page at `/` and an About page at `/about`. After signing in, open `/agents`; each agent has dedicated routes such as `/agents/<agent-id>/workflow`, `/knowledge`, `/playground`, `/analytics`, `/conversations`, `/improve`, `/deploy`, and `/settings` (append each view to the agent URL). Workspace-wide analytics and conversations are `/analytics` and `/conversations`; plan and billing is `/plans`.
+
+### Global admin panel
+
+The standalone global admin console runs at `http://localhost:3001`, separately from the customer dashboard. To grant access, first run the app and create/sign in to your account. In the same browser, open `http://localhost:8000/api/v1/auth/me` and copy the `id` value. Stop the app, set `ADMIN_USER_ID=<that id>` in the root `.env`, and restart. Sign in to the admin console with that account. The API checks this ID on every admin request; an email address alone does not grant access. Admins can search all accounts, change plans, suspend/reactivate accounts, publish/unpublish agents, inspect global conversations, select Stripe or Razorpay for new checkouts, and review the admin audit log. Suspending an account revokes its active sessions and API keys. A Stripe webhook can later resync a manually changed plan for accounts with an active Stripe subscription.
+
+Or start the API and each frontend in separate terminals from the repository root:
 
 ```powershell
 python -m venv .venv
@@ -37,6 +43,14 @@ python -m venv .venv
 
 ```powershell
 cd apps/web
+npm ci
+npm run dev
+```
+
+Run the admin console separately in another terminal:
+
+```powershell
+cd apps/admin
 npm ci
 npm run dev
 ```
@@ -71,6 +85,7 @@ Copy `.env.example` to `.env` at the repository root. The API reads this file on
 | --- | --- |
 | `DATABASE_URL` | SQLite by default; production can use `postgresql+psycopg://user:password@host/db` |
 | `WEB_ORIGIN` | Exact allowed dashboard origin; used for CORS and origin checks |
+| `ADMIN_WEB_ORIGIN`, `ADMIN_USER_ID` | Separate admin console origin and the one account authorized for global administration |
 | `PUBLIC_WEB_URL` | Hosted chat base URL and billing return URLs |
 | `APP_ENV=production` | Enables Secure cookies; use HTTPS |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | Enable live language-model generation |
@@ -85,9 +100,14 @@ Copy `.env.example` to `.env` at the repository root. The API reads this file on
 | `OPENAI_COMPLEX_MODEL` | Optional model for longer or comparative questions |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Enable billing and verify incoming Stripe events |
 | `STRIPE_PRO_PRICE_ID`, `STRIPE_TEAM_PRICE_ID` | Recurring price IDs from your Stripe account |
+| `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` | API credentials and webhook signature secret for Razorpay |
+| `RAZORPAY_PRO_PLAN_ID`, `RAZORPAY_TEAM_PLAN_ID` | Recurring Razorpay subscription plan IDs |
+| `PAYMENT_PROVIDER` | Initial gateway (`stripe` or `razorpay`); the admin console selection is stored in the database |
 | `INPUT_COST_PER_MILLION`, `OUTPUT_COST_PER_MILLION` | Token price estimates in USD, defaulting to the small-model estimate |
 
-Stripe webhook endpoint: `/api/v1/webhooks/stripe`. Subscribe to `checkout.session.completed`, `customer.subscription.updated`, and `customer.subscription.deleted`. Use Stripe test mode first. The server sets a paid plan only from verified payment/subscription events; checkout alone does not upgrade the account.
+Stripe webhook endpoint: `/api/v1/webhooks/stripe`. Subscribe to `checkout.session.completed`, `customer.subscription.updated`, and `customer.subscription.deleted`. Razorpay webhook endpoint: `/api/v1/webhooks/razorpay`; subscribe to `subscription.activated`, `subscription.charged`, `subscription.resumed`, `subscription.cancelled`, `subscription.completed`, and `subscription.halted`. Use each provider's test credentials and matching test-mode plans/webhooks first. The server grants or removes paid access only from verified, deduplicated webhook events; a browser return alone does not upgrade an account. Select the active gateway in **Admin console → Payment provider**. Gateway credentials remain in the API environment, while the admin console stores only the selected provider.
+
+Create monthly recurring Pro and Team plans in Razorpay and place their plan IDs in `.env`. The plan currency and amount are defined by Razorpay; ensure they match the pricing you intend to offer. Configure the Razorpay webhook secret in both the Razorpay dashboard and `RAZORPAY_WEBHOOK_SECRET`.
 
 ```html
 <script src="http://localhost:8000/widget.js"
@@ -113,7 +133,7 @@ The backend tests cover authentication, tenant isolation, ingestion, cited SSE a
 docker compose up --build
 ```
 
-The app is at port 3000 and the API at 8000. PostgreSQL and Redis data persist in named volumes. Set `POSTGRES_PASSWORD` before deploying. Use a reverse proxy with HTTPS, exact public origins, request body limits, and SSE buffering disabled. A same-site API/dashboard deployment is recommended for cookies. The versioned bootstrap migration runs on startup; `python -m services.api.migrations` also applies it as a release step. Back up data before future schema changes.
+The customer app is at port 3000, the standalone admin console at 3001, and the API at 8000. PostgreSQL and Redis data persist in named volumes. Set `POSTGRES_PASSWORD` before deploying. Use a reverse proxy with HTTPS, exact public origins, request body limits, and SSE buffering disabled. A same-site API/dashboard deployment is recommended for cookies. The versioned bootstrap migration runs on startup; `python -m services.api.migrations` also applies it as a release step. Back up data before future schema changes.
 
 ## Scope and production limits
 
@@ -133,6 +153,7 @@ See [verification record](docs/VERIFICATION.md) for the checks run in this works
 
 ```text
 apps/web/             Next.js dashboard and hosted chat
+apps/admin/           Separate Next.js global admin console
 apps/widget/          Framework-independent embed script
 services/api/         FastAPI, SQLAlchemy, ingestion and retrieval
 services/api/tests/   Unit and API integration coverage
@@ -140,3 +161,14 @@ infra/                Container definitions
 scripts/              Local launch helper
 .github/workflows/    CI checks
 ```
+
+
+| Block | What it does |
+|---|---|
+| **Detect intent** | Compares the visitor’s message against the example phrases you entered for each intent, then follows the closest matching route. This is a simple word-overlap matcher, **not an AI intent classifier**. Unmatched messages follow “Otherwise.” |
+| **Send message** | Adds the configured text to the response. You can insert saved values such as `{{email}}`. |
+| **Collect information** | Asks the visitor a question, pauses the workflow, and saves their reply in that conversation. It can validate text, email, or number. It doesn’t automatically look up private client information. |
+| **Check condition** | Checks a saved value and follows the True or False route. Available checks include equals, contains, exists, and greater than. |
+| **Call an API** | Makes a server-side request to the configured public HTTP(S) endpoint. It can use captured values in the URL or request body, save the result for later nodes, and follow success or error routes. |
+| **Search knowledge** | Searches this agent’s indexed documents for the configured question, normally `{{message}}`, and responds with evidence/citations or abstains if evidence is weak. |
+| **End** | Stops the current workflow run. Saved conversation values can be available to later messages in that conversation. |

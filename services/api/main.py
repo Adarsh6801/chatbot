@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 from .config import WEB_ORIGIN, PUBLIC_WEB_URL, PRODUCTION, PLANS
-from .database import Base, engine, Session, get_db, User, LoginSession, Bot, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, WebhookEvent, Workflow, now
+from .database import Base, engine, Session, get_db, User, LoginSession, Bot, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, now
 from .security import current_user, owned_bot, password_hash, verify_password, digest, rate_limit
 from .ingestion import ingest, parse_file, eval_bot, MAX_BYTES
 from .rag import retrieve, rerank, generate, generate_stream, INJECTION
@@ -46,7 +46,14 @@ from .oauth import router as oauth_router
 app.include_router(oauth_router)
 from .workflow import router as workflow_router
 app.include_router(workflow_router)
-app.add_middleware(CORSMiddleware, allow_origins=[WEB_ORIGIN], allow_credentials=True, allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], allow_headers=['Content-Type', 'Authorization', 'X-AgentForge-Client'])
+from .admin import router as admin_router
+app.include_router(admin_router)
+from .billing import router as billing_router
+app.include_router(billing_router)
+from .payment_settings import get_payment_provider, payment_provider_status
+ADMIN_WEB_ORIGIN = os.getenv('ADMIN_WEB_ORIGIN', 'http://localhost:3001')
+TRUSTED_WEB_ORIGINS = [WEB_ORIGIN, ADMIN_WEB_ORIGIN]
+app.add_middleware(CORSMiddleware, allow_origins=TRUSTED_WEB_ORIGINS, allow_credentials=True, allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], allow_headers=['Content-Type', 'Authorization', 'X-AgentForge-Client'])
 
 @app.middleware('http')
 async def security_headers(request, call_next):
@@ -56,7 +63,7 @@ async def security_headers(request, call_next):
         return Response(headers=headers)
     # Cookie-authenticated mutations require the trusted origin; API keys use explicit credentials.
     if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.cookies.get('agentforge_session') and not request.url.path.startswith('/api/v1/chat/'):
-        if request.headers.get('origin') not in (None, WEB_ORIGIN):
+        if request.headers.get('origin') not in (None, *TRUSTED_WEB_ORIGINS):
             return Response('Untrusted request origin', status_code=403)
         if request.headers.get('X-AgentForge-Client') != 'dashboard' and not request.headers.get('authorization', '').startswith('Bearer '):
             return Response('Missing dashboard request header', status_code=403)
@@ -141,9 +148,6 @@ class FixInput(BaseModel):
 class KeyInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
 
-class CheckoutInput(BaseModel):
-    plan: str
-
 class ProfileInput(BaseModel):
     name:str=Field(min_length=1,max_length=80)
     company:str=Field(default='',max_length=120)
@@ -161,7 +165,7 @@ class ProfileInput(BaseModel):
         return value
 
 def user_data(user):
-    return {'id': user.id, 'email': user.email, 'name': user.name, 'plan': user.plan,'avatar_url':user.avatar_url or '', 'company':user.company or '', 'bio':user.bio or '', 'google_connected':bool(user.google_sub),'created_at':user.created_at}
+    return {'id': user.id, 'email': user.email, 'name': user.name, 'plan': user.plan,'avatar_url':user.avatar_url or '', 'company':user.company or '', 'bio':user.bio or '', 'google_connected':bool(user.google_sub),'created_at':user.created_at,'is_active':bool(user.is_active),'is_admin':bool(os.getenv('ADMIN_USER_ID', '').strip() and user.id == os.getenv('ADMIN_USER_ID', '').strip()),'billing_provider':user.billing_provider}
 
 def bot_data(bot, db):
     return {key: getattr(bot, key) for key in ('id', 'name', 'description', 'slug', 'public_key', 'system_prompt', 'widget_config', 'threshold', 'created_at')} | {'published':bool(bot.published),'documents': db.query(Document).filter_by(bot_id=bot.id).count(), 'messages': db.query(Message).filter_by(bot_id=bot.id, role='assistant').count()}
@@ -201,6 +205,7 @@ def login(body: AuthInput, request: Request, response: Response, db: DBSession =
     rate_limit(db, 'login:' + (request.client.host if request.client else 'unknown'), 20, 900)
     user = db.query(User).filter_by(email=body.email).first()
     if not user or not verify_password(body.password, user.password): raise HTTPException(401, 'Email or password is incorrect.')
+    if not user.is_active: raise HTTPException(403, 'This account has been suspended. Contact support.')
     set_session(response, db, user)
     return user_data(user)
 
@@ -474,7 +479,10 @@ def evals(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_use
 @app.get('/api/v1/account/usage')
 def usage(db: DBSession = Depends(get_db), user=Depends(current_user)):
     month = datetime.now(timezone.utc).strftime('%Y-%m')
-    return {'plan': user.plan, 'limits': PLANS[user.plan], 'bots': db.query(Bot).filter_by(user_id=user.id).count(), 'documents': db.query(Document).join(Bot).filter(Bot.user_id == user.id).count(), 'messages': db.query(Message).join(Bot).filter(Bot.user_id == user.id, Message.role == 'user', Message.created_at.startswith(month)).count(), 'billing_configured': bool(os.getenv('STRIPE_SECRET_KEY') and os.getenv('STRIPE_PRO_PRICE_ID') and os.getenv('STRIPE_TEAM_PRICE_ID')),'has_subscription':bool(user.stripe_customer_id)}
+    selected_provider = get_payment_provider(db)
+    user_has_subscription = bool(user.plan != 'free' and ((user.billing_provider == 'stripe' and user.stripe_customer_id and user.subscription_id) or (user.billing_provider == 'razorpay' and user.razorpay_subscription_id)))
+    billing_provider = user.billing_provider if user_has_subscription else selected_provider
+    return {'plan': user.plan, 'limits': PLANS[user.plan], 'bots': db.query(Bot).filter_by(user_id=user.id).count(), 'documents': db.query(Document).join(Bot).filter(Bot.user_id == user.id).count(), 'messages': db.query(Message).join(Bot).filter(Bot.user_id == user.id, Message.role == 'user', Message.created_at.startswith(month)).count(), 'billing_configured': payment_provider_status()[selected_provider]['configured'], 'has_subscription': user_has_subscription, 'payment_provider': billing_provider}
 
 @app.get('/api/v1/account/keys')
 def keys(db: DBSession = Depends(get_db), user=Depends(current_user)):
@@ -492,53 +500,6 @@ def create_key(body: KeyInput, db: DBSession = Depends(get_db), user=Depends(cur
 @app.delete('/api/v1/account/keys/{key_id}')
 def revoke_key(key_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
     db.query(ApiKey).filter_by(id=key_id, user_id=user.id).delete()
-    db.commit()
-    return {'ok': True}
-
-@app.post('/api/v1/billing/checkout')
-def checkout(body: CheckoutInput, db: DBSession = Depends(get_db), user=Depends(current_user)):
-    if body.plan not in ('pro', 'team'): raise HTTPException(422, 'Choose Pro or Team.')
-    key, price = os.getenv('STRIPE_SECRET_KEY'), os.getenv(f'STRIPE_{body.plan.upper()}_PRICE_ID')
-    if not key or not price: raise HTTPException(503, 'Billing is not configured. Set Stripe credentials and price IDs.')
-    import stripe
-    stripe.api_key = key
-    if user.subscription_id and user.stripe_customer_id and user.plan!='free':
-        return {'url':stripe.billing_portal.Session.create(customer=user.stripe_customer_id,return_url=PUBLIC_WEB_URL).url}
-    kwargs = {'customer': user.stripe_customer_id} if user.stripe_customer_id else {'customer_email': user.email}
-    session = stripe.checkout.Session.create(mode='subscription', line_items=[{'price': price, 'quantity': 1}], client_reference_id=user.id, metadata={'user_id': user.id, 'plan': body.plan}, subscription_data={'metadata': {'user_id': user.id, 'plan': body.plan}}, success_url=PUBLIC_WEB_URL + '/?billing=success', cancel_url=PUBLIC_WEB_URL + '/?billing=cancelled', **kwargs)
-    return {'url': session.url}
-
-@app.post('/api/v1/billing/portal')
-def portal(user=Depends(current_user)):
-    if not os.getenv('STRIPE_SECRET_KEY') or not user.stripe_customer_id: raise HTTPException(503, 'No active billing account.')
-    import stripe
-    stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
-    return {'url': stripe.billing_portal.Session.create(customer=user.stripe_customer_id, return_url=PUBLIC_WEB_URL).url}
-
-@app.post('/api/v1/webhooks/stripe')
-async def stripe_webhook(request: Request, db: DBSession = Depends(get_db)):
-    secret = os.getenv('STRIPE_WEBHOOK_SECRET')
-    if not secret: raise HTTPException(503, 'Stripe webhooks are not configured.')
-    import stripe
-    try: event = stripe.Webhook.construct_event(await request.body(), request.headers.get('stripe-signature', ''), secret)
-    except (ValueError, stripe.SignatureVerificationError): raise HTTPException(400, 'Invalid webhook signature.')
-    if db.get(WebhookEvent, event['id']): return {'ok': True}
-    obj = event['data']['object'].to_dict()
-    kind = event['type']
-    if kind == 'checkout.session.completed' and obj.get('payment_status') == 'paid':
-        user = db.get(User, obj.get('client_reference_id'))
-        if user:
-            user.stripe_customer_id, user.subscription_id = obj.get('customer'), obj.get('subscription')
-            user.plan = obj.get('metadata', {}).get('plan') if obj.get('metadata', {}).get('plan') in PLANS else 'free'
-    elif kind in ('customer.subscription.updated', 'customer.subscription.deleted'):
-        user = db.query(User).filter_by(subscription_id=obj['id']).first()
-        if user:
-            items=obj.get('items',{}).get('data',[])
-            price=items[0].get('price',{}).get('id') if items else None
-            mapped=next((tier for tier in ('pro','team') if price and price==os.getenv(f'STRIPE_{tier.upper()}_PRICE_ID')),None)
-            plan = mapped or obj.get('metadata', {}).get('plan', 'free')
-            user.plan = plan if obj.get('status') in ('active', 'trialing') and plan in PLANS and kind != 'customer.subscription.deleted' else 'free'
-    db.add(WebhookEvent(id=event['id']))
     db.commit()
     return {'ok': True}
 

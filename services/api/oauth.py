@@ -55,6 +55,7 @@ async def google_callback(request:Request, code:str='', state:str='', db=Depends
         taken=db.query(User).filter(User.google_sub==info['sub'],User.id!=user.id).first()
         if taken: raise HTTPException(409,'That Google account is connected to another workspace.')
     else: user=db.query(User).filter_by(google_sub=info['sub']).first() or db.query(User).filter_by(email=email).first()
+    if user and not user.is_active: raise HTTPException(403,'This account has been suspended. Contact support.')
     if not user:
         user=User(email=email,name=info.get('name','Builder')[:80],password=password_hash(secrets.token_urlsafe(48)))
         db.add(user)
@@ -64,7 +65,7 @@ async def google_callback(request:Request, code:str='', state:str='', db=Depends
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'That Google account is already connected. Please sign in again.')
-    response=RedirectResponse(PUBLIC_WEB_URL)
+    response=RedirectResponse(PUBLIC_WEB_URL + '/agents')
     from .main import set_session
     set_session(response,db,user)
     response.delete_cookie('af_oauth_state')

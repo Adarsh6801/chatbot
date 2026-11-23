@@ -23,12 +23,13 @@ def current_user(request: Request, db: Session = Depends(get_db)):
     if bearer.startswith('Bearer '):
         key = db.query(ApiKey).filter_by(key_hash=digest(bearer[7:])).first()
         if key:
-            return db.get(User, key.user_id)
+            user = db.get(User, key.user_id)
+            if user and user.is_active: return user
     if token:
         session = db.get(LoginSession, digest(token))
         if session and session.expires_at > time.time():
             user = db.get(User, session.user_id)
-            if user: return user
+            if user and user.is_active: return user
     raise HTTPException(401, 'Sign in to continue.')
 
 def owned_bot(db, bot_id, user):
