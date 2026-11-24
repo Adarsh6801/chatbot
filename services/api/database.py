@@ -168,6 +168,17 @@ class WebhookEvent(Base):
     id = Column(String, primary_key=True)
     created_at = Column(String, default=now)
 
+class Payment(Base):
+    __tablename__ = 'payments'
+    id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    provider = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False)
+    plan = Column(String, nullable=False, default='')
+    amount = Column(Integer, nullable=True)
+    currency = Column(String, nullable=True)
+    created_at = Column(String, default=now, nullable=False, index=True)
+
 class AdminAudit(Base):
     __tablename__ = 'admin_audit'
     id = Column(String, primary_key=True, default=uid)

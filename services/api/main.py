@@ -758,8 +758,8 @@ def usage(db: DBSession = Depends(get_db), user=Depends(current_user)):
     month = datetime.now(timezone.utc).strftime('%Y-%m')
     selected_provider = get_payment_provider(db)
     user_has_subscription = bool(user.plan != 'free' and ((user.billing_provider == 'stripe' and user.stripe_customer_id and user.subscription_id) or (user.billing_provider == 'razorpay' and user.razorpay_subscription_id)))
-    billing_provider = user.billing_provider if user_has_subscription else selected_provider
-    return {'plan': user.plan, 'limits': PLANS[user.plan], 'bots': db.query(Bot).filter_by(user_id=user.id).count(), 'documents': db.query(Document).join(Bot).filter(Bot.user_id == user.id).count(), 'messages': db.query(Message).join(Bot).filter(Bot.user_id == user.id, Message.role == 'user', Message.created_at.startswith(month)).count(), 'billing_configured': payment_provider_status()[selected_provider]['configured'], 'has_subscription': user_has_subscription, 'payment_provider': billing_provider}
+    billing_provider = ('razorpay' if user.razorpay_subscription_id else 'stripe') if (user.razorpay_subscription_id or user.subscription_id) else selected_provider
+    return {'plan': user.plan, 'limits': PLANS[user.plan], 'bots': db.query(Bot).filter_by(user_id=user.id).count(), 'documents': db.query(Document).join(Bot).filter(Bot.user_id == user.id).count(), 'messages': db.query(Message).join(Bot).filter(Bot.user_id == user.id, Message.role == 'user', Message.created_at.startswith(month)).count(), 'billing_configured': payment_provider_status()[selected_provider]['configured'], 'has_subscription': user_has_subscription, 'has_pending_subscription': bool(user.razorpay_subscription_id or user.subscription_id), 'payment_provider': billing_provider}
 
 @app.get('/api/v1/account/keys')
 def keys(db: DBSession = Depends(get_db), user=Depends(current_user)):

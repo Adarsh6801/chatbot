@@ -3,11 +3,11 @@ import os, json, struct, asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Request, Response
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .config import PLANS
-from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, Bot, Conversation, Document, LoginSession, Message, SupportTicket, SupportTicketMessage, User, get_db, now
+from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, Bot, Conversation, Document, LoginSession, Message, Payment, SupportTicket, SupportTicketMessage, User, get_db, now
 from .payment_settings import get_payment_provider, payment_provider_status
 from .security import current_user
 from .providers import store_site_logo, read_site_logo
@@ -83,6 +83,33 @@ def overview(db: Session = Depends(get_db), _admin: User = Depends(require_admin
 @router.get("/settings/payment-provider")
 def get_payment_settings(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
     return {"provider": get_payment_provider(db), "providers": payment_provider_status()}
+
+
+@router.get("/payments")
+def payments(page: int = 1, limit: int = 25, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    page, limit = max(1, page), min(100, max(1, limit))
+    query = db.query(Payment, User).join(User, Payment.user_id == User.id)
+    total = query.count()
+    records = query.order_by(Payment.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    items = [{"id": payment.id, "provider": payment.provider, "status": payment.status, "plan": payment.plan,
+              "amount": payment.amount, "currency": payment.currency, "created_at": payment.created_at,
+              "user_name": user.name, "user_email": user.email} for payment, user in records]
+    return {"items": items, "total": total, "page": page, "limit": limit}
+
+
+@router.get("/subscriptions")
+def subscriptions(page: int = 1, limit: int = 25, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    page, limit = max(1, page), min(100, max(1, limit))
+    query = db.query(User).filter(or_(User.subscription_id.isnot(None), User.razorpay_subscription_id.isnot(None)))
+    total = query.count()
+    accounts = query.order_by(User.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    items = []
+    for account in accounts:
+        provider = "razorpay" if account.razorpay_subscription_id else (account.billing_provider or "stripe")
+        items.append({"id": account.razorpay_subscription_id or account.subscription_id, "provider": provider,
+                      "status": "active" if account.plan != "free" else "pending", "plan": account.plan,
+                      "created_at": account.created_at, "user_name": account.name, "user_email": account.email})
+    return {"items": items, "total": total, "page": page, "limit": limit}
 
 
 @router.put("/settings/payment-provider")

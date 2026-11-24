@@ -16,11 +16,13 @@ import {
   FileText,
   Flame,
   Globe,
+  Headphones,
   HelpCircle,
   KeyRound,
   LayoutDashboard,
   LogOut,
   MessageSquare,
+  MessageCircle,
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
@@ -51,6 +53,7 @@ import "@/components/account.css";
 import { api, API, Bot } from "@/lib/api";
 import "@/components/workspace-polish.css";
 import "@/components/support.css";
+import "@/components/agent-widget-preview.css";
 
 type User = UserProfile;
 type Section =
@@ -231,14 +234,19 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
     }
   }
   useEffect(() => {
-    const result = new URLSearchParams(window.location.search).get("billing");
+    const params = new URLSearchParams(window.location.search);
+    const result = params.get("billing");
     if (result) {
       navigateSection("billing");
-      setToast(
-        result === "success"
-          ? "Checkout completed. Your plan updates after payment confirmation."
-          : "Checkout cancelled. Your current plan is unchanged.",
-      );
+      if (result === "success") {
+        const checkoutSessionId = params.get("checkout_session_id");
+        setToast("Checkout returned. Checking subscription status…");
+        void api("/billing/status", { method: "POST", body: JSON.stringify({ checkout_session_id: checkoutSessionId }) })
+          .then((status: any) => setToast(status.status === "active" ? `Subscription active. Your ${status.plan} plan is ready.` : "Payment is still processing. Your plan will update when the provider confirms it."))
+          .catch(() => setToast("Payment is still processing. Your plan will update when the provider confirms it."));
+      } else {
+        setToast("Checkout cancelled. Your current plan is unchanged.");
+      }
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
@@ -736,7 +744,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
               notify={setToast}
             />
           ) : section === "billing" ? (
-            <Billing usage={usage} action={action} busy={busy} />
+            <Billing usage={usage} action={action} busy={busy} refresh={refresh} notify={setToast} />
           ) : section === "keys" ? (
             <Keys action={action} notify={setToast} />
           ) : (
@@ -917,6 +925,7 @@ function AgentDetail({
   const [logoPreview, setLogoPreview] = useState((bot.widget_config.logo || "").startsWith("s3://") ? `${API}/api/v1/bots/${bot.id}/widget/logo` : bot.widget_config.logo || "");
   const [logoUploading, setLogoUploading] = useState(false);
   const [logoUploadError, setLogoUploadError] = useState("");
+  const [widgetPreview, setWidgetPreview] = useState(() => ({name:bot.name, greeting:bot.widget_config.greeting, color:bot.widget_config.color, position:bot.widget_config.position, launcherIcon:bot.widget_config.launcher_icon || "sparkle"}));
   const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
   const [agentVersions, setAgentVersions] = useState<any[]>([]);
   const [selectedVersionId, setSelectedVersionId] = useState("");
@@ -961,6 +970,9 @@ function AgentDetail({
     setLogoUrlInput(ref.startsWith("https://") ? ref : "");
     setLogoPreview(ref.startsWith("s3://") ? `${API}/api/v1/bots/${bot.id}/widget/logo` : ref);
   }, [bot.id, bot.widget_config.logo]);
+  useEffect(() => {
+    setWidgetPreview({name:bot.name, greeting:bot.widget_config.greeting, color:bot.widget_config.color, position:bot.widget_config.position, launcherIcon:bot.widget_config.launcher_icon || "sparkle"});
+  }, [bot.id, bot.name, bot.widget_config.greeting, bot.widget_config.color, bot.widget_config.position, bot.widget_config.launcher_icon]);
   useEffect(() => {setVersionHistoryOpen(false);setAgentVersions([]);setSelectedVersionId("");setVersionError("");}, [bot.id]);
   useEffect(() => {
     load();
@@ -1551,6 +1563,7 @@ function AgentDetail({
             <input
               name="name"
               defaultValue={bot.name}
+              onChange={event=>setWidgetPreview(current=>({...current,name:event.target.value}))}
               required
               maxLength={80}
             />
@@ -1581,6 +1594,7 @@ function AgentDetail({
           <input
             name="greeting"
             defaultValue={bot.widget_config.greeting}
+            onChange={event=>setWidgetPreview(current=>({...current,greeting:event.target.value}))}
             maxLength={500}
           />
         </label>
@@ -1591,18 +1605,19 @@ function AgentDetail({
               name="color"
               type="color"
               defaultValue={bot.widget_config.color}
+              onChange={event=>setWidgetPreview(current=>({...current,color:event.target.value}))}
             />
           </label>
           <label>
             Widget position
-            <select name="position" defaultValue={bot.widget_config.position}>
+            <select name="position" defaultValue={bot.widget_config.position} onChange={event=>setWidgetPreview(current=>({...current,position:event.target.value}))}>
               <option value="right">Bottom right</option>
               <option value="left">Bottom left</option>
             </select>
           </label>
           <label>
             Chat launcher icon
-            <select name="launcher_icon" defaultValue={bot.widget_config.launcher_icon || "sparkle"}>
+            <select name="launcher_icon" defaultValue={bot.widget_config.launcher_icon || "sparkle"} onChange={event=>setWidgetPreview(current=>({...current,launcherIcon:event.target.value}))}>
               <option value="sparkle">Sparkle</option>
               <option value="message">Message bubble</option>
               <option value="chat">Chat bubble</option>
@@ -1641,6 +1656,7 @@ function AgentDetail({
           {logoPreview && <div className="widget-logo-preview"><img src={logoPreview} alt="Agent chat logo preview"/><button type="button" className="danger" onClick={() => {setLogoRef("");setLogoUrlInput("");setLogoPreview("");}}>Remove logo</button></div>}
           {logoUploadError && <div className="error" role="alert">{logoUploadError}</div>}
         </div>
+        <WidgetAppearancePreview settings={widgetPreview} logo={logoPreview} />
         <label>
           Abstention threshold
           <input
@@ -1777,15 +1793,52 @@ function EvalPanel({ base }: { base: string }) {
     </div>
   );
 }
+function WidgetAppearancePreview({settings, logo}: {settings:{name:string;greeting:string;color:string;position:string;launcherIcon:string};logo:string}) {
+  return <section className="widget-appearance-preview" aria-label="Live chat widget preview">
+    <div className="widget-preview-heading"><div><h3>Live widget preview</h3><p>Updates as you change the appearance settings. Save changes to apply them to the live agent.</p></div><span>PREVIEW</span></div>
+    <div className="widget-preview-stage">
+      <div className="preview-site-top"><span className="preview-site-mark"/><span/><span/><i/></div>
+      <div className="preview-site-copy"><small>YOUR WEBSITE</small><b>Helpful answers,<br/>right when they’re needed.</b><span/><span/><span/></div>
+      <div className={`preview-chat-window ${settings.position === "left" ? "left" : "right"}`}>
+        <div className="preview-chat-top"><div className="preview-agent-avatar" style={{background:settings.color}}>{logo ? <img src={logo} alt=""/> : <Sparkles size={18}/>}</div><div className="preview-agent-name"><strong>{settings.name || "Your agent"}</strong><small><i/> Ready to help</small></div><span className="preview-chat-dots">•••</span></div>
+        <div className="preview-chat-body"><div className="preview-chat-greeting"><div className="preview-greeting-orb"><Sparkles size={20}/></div><strong>Your answers start here.</strong><p>{settings.greeting || "Add a welcome message in the settings."}</p><span>What can you help me with? <ArrowRight size={12}/></span></div></div>
+        <div className="preview-chat-input"><span>Ask a question…</span><i style={{background:settings.color}}><ArrowRight size={13}/></i></div>
+        <div className="preview-chat-footer">Powered by AgentForge · Answers include source evidence</div>
+      </div>
+      <div className={`preview-launcher ${settings.position === "left" ? "left" : "right"}`} style={{background:settings.color}} aria-label={`${settings.launcherIcon} launcher icon`}>
+        {settings.launcherIcon === "message" ? <MessageCircle size={22}/> : settings.launcherIcon === "chat" ? <MessageSquare size={22}/> : settings.launcherIcon === "headset" ? <Headphones size={22}/> : <Sparkles size={22}/>}
+      </div>
+      <div className="preview-position-label">Launcher · bottom {settings.position === "left" ? "left" : "right"}</div>
+    </div>
+  </section>;
+}
+
 function Billing({
   usage,
   action,
   busy,
+  refresh,
+  notify,
 }: {
   usage: any;
   action: (fn: () => Promise<any>, s?: string) => Promise<void>;
   busy: boolean;
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
 }) {
+  async function checkSubscriptionStatus() {
+    try {
+      const status: any = await api("/billing/status", { method: "POST", body: JSON.stringify({}) });
+      if (status.status === "active" || status.status === "authenticated") {
+        await refresh();
+        notify(`Razorpay subscription confirmed. Your ${status.plan} plan is ready.`);
+      } else {
+        notify("Razorpay has not marked this subscription active yet. Check again in a few seconds.");
+      }
+    } catch {
+      notify("Could not check Razorpay right now. Please try again.");
+    }
+  }
   return (
     <>
       <div className="page-heading">
@@ -1807,6 +1860,11 @@ function Billing({
         >
           {usage?.payment_provider === "razorpay" ? "Cancel at renewal" : "Manage subscription"} <ExternalLink size={14} />
         </button>
+        {usage?.payment_provider === "razorpay" && usage?.has_pending_subscription && (
+          <button className="secondary" disabled={busy} onClick={() => void checkSubscriptionStatus()}>
+            Check subscription status <RefreshCw size={14} />
+          </button>
+        )}
       </div>
       <div className="plan-grid">
         {[
@@ -1866,11 +1924,39 @@ function Billing({
               }
               onClick={() =>
                 action(async () => {
+                  const checkoutWindow = window.open("about:blank", "_blank");
+                  if (!checkoutWindow) throw new Error("Allow pop-ups for this site to open Razorpay checkout in a separate tab.");
                   const d = await api("/billing/checkout", {
                     method: "POST",
                     body: JSON.stringify({ plan: p.name.toLowerCase() }),
                   });
-                  window.location.assign(d.url);
+                  if (d.already_active) {
+                    checkoutWindow.close();
+                    notify(`Your ${d.plan} subscription is active.`);
+                    return;
+                  }
+                  if (!d.url) {
+                    checkoutWindow.close();
+                    throw new Error("Razorpay did not return a checkout link for this subscription update.");
+                  }
+                  checkoutWindow.location.assign(d.url);
+                  if (usage?.payment_provider === "razorpay") {
+                    notify("Razorpay checkout opened in a new tab. Keep this page open while we check the subscription.");
+                    void (async () => {
+                      for (let attempt = 0; attempt < 36; attempt += 1) {
+                        await new Promise(resolve => window.setTimeout(resolve, 5000));
+                        try {
+                          const status: any = await api("/billing/status", { method: "POST", body: JSON.stringify({}) });
+                          if (status.status === "active" || status.status === "authenticated") {
+                            await refresh();
+                            notify(`Razorpay subscription confirmed. Your ${status.plan} plan is ready.`);
+                            return;
+                          }
+                        } catch { /* Keep checking while Razorpay finishes authorization. */ }
+                      }
+                      notify("Still waiting for Razorpay to activate the subscription. Use Check subscription status to retry.");
+                    })();
+                  }
                 })
               }
             >

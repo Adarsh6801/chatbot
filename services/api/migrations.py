@@ -46,6 +46,7 @@ def migrate():
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (6) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (7) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (8) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (9) ON CONFLICT (version) DO NOTHING'))
     with Session() as db:
         for bot in db.query(Bot).all():
             widget = dict(bot.widget_config or {})
@@ -58,4 +59,4 @@ def migrate():
 
 if __name__ == '__main__':
     migrate()
-    print('AgentForge schema version 8 applied.')
+    print('AgentForge schema version 9 applied.')
