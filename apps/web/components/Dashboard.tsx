@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import { SiteLogo, SiteName } from "@/components/SiteBranding";
 import { usePathname, useRouter } from "next/navigation";
 import {
   Activity,
@@ -255,11 +256,9 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
     <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
         <div className="sidebar-brand-row">
-          <a className="brand" href="/" aria-label="AgentForge home">
-            <div className="brand-icon">
-              <Flame size={22} />
-            </div>
-            <span className="brand-name">AgentForge<span className="brand-dot">.</span></span>
+          <a className="brand" href="/" aria-label="Home">
+            <SiteLogo className="brand-icon" fallback={<div className="brand-icon"><Flame size={22} /></div>} alt="" />
+            <span className="brand-name"><SiteName period /></span>
           </a>
           <button className="sidebar-toggle" onClick={toggleSidebar} aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
             {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
@@ -788,7 +787,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
           )}
         </main>
         <footer className="app-footer">
-          Made for curious builders.<span>AgentForge · v1.0</span>
+          Made for curious builders.<span><SiteName/> · v1.0</span>
         </footer>
       </div>
       {toast && (
@@ -910,6 +909,19 @@ function AgentDetail({
   const { confirm: confirmDialog } = useDialogs();
   const router = useRouter();
   const [page, setPage] = useState(1);
+  const [selectedVisitor, setSelectedVisitor] = useState<any>(null);
+  const [visitorConversations, setVisitorConversations] = useState<any[] | null>(null);
+  const [visitorLoading, setVisitorLoading] = useState(false);
+  const [logoRef, setLogoRef] = useState(bot.widget_config.logo || "");
+  const [logoUrlInput, setLogoUrlInput] = useState((bot.widget_config.logo || "").startsWith("https://") ? bot.widget_config.logo : "");
+  const [logoPreview, setLogoPreview] = useState((bot.widget_config.logo || "").startsWith("s3://") ? `${API}/api/v1/bots/${bot.id}/widget/logo` : bot.widget_config.logo || "");
+  const [logoUploading, setLogoUploading] = useState(false);
+  const [logoUploadError, setLogoUploadError] = useState("");
+  const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
+  const [agentVersions, setAgentVersions] = useState<any[]>([]);
+  const [selectedVersionId, setSelectedVersionId] = useState("");
+  const [versionLoading, setVersionLoading] = useState(false);
+  const [versionError, setVersionError] = useState("");
   const cacheKey = `${bot.id}:${tab}:${page}`;
   const [data, setData] = useState<any>(() => agentPageCache.get(cacheKey) ?? null),
     [mode, setMode] = useState("upload"),
@@ -922,7 +934,7 @@ function AgentDetail({
         : tab === "Analytics"
           ? "/analytics/summary"
           : tab === "Conversations"
-            ? "/conversations?page=" + page
+            ? "/visitors?page=" + page
             : tab === "Improve"
               ? "/flags"
               : null;
@@ -940,7 +952,16 @@ function AgentDetail({
   useEffect(() => {
     setData(agentPageCache.get(cacheKey) ?? null);
     setLoadError("");
+    setSelectedVisitor(null);
+    setVisitorConversations(null);
   }, [cacheKey]);
+  useEffect(() => {
+    const ref = bot.widget_config.logo || "";
+    setLogoRef(ref);
+    setLogoUrlInput(ref.startsWith("https://") ? ref : "");
+    setLogoPreview(ref.startsWith("s3://") ? `${API}/api/v1/bots/${bot.id}/widget/logo` : ref);
+  }, [bot.id, bot.widget_config.logo]);
+  useEffect(() => {setVersionHistoryOpen(false);setAgentVersions([]);setSelectedVersionId("");setVersionError("");}, [bot.id]);
   useEffect(() => {
     load();
   }, [tab, page]); // eslint-disable-line
@@ -953,6 +974,54 @@ function AgentDetail({
   async function mutate(fn: () => Promise<any>, message: string) {
     await action(fn, message);
     await load();
+  }
+  async function openVisitor(visitor: any) {
+    setSelectedVisitor(visitor);
+    setVisitorConversations(null);
+    setVisitorLoading(true);
+    try {
+      const result = await api(base + "/visitor-conversations?visitor_key=" + encodeURIComponent(visitor.key));
+      setVisitorConversations(result.items);
+    } catch (e) {
+      setLoadError((e as Error).message);
+    } finally {
+      setVisitorLoading(false);
+    }
+  }
+  async function toggleVersionHistory() {
+    if (versionHistoryOpen) {setVersionHistoryOpen(false);return;}
+    setVersionHistoryOpen(true);setVersionLoading(true);setVersionError("");
+    try {
+      const result = await api<{items:any[]}>(base + "/versions");
+      setAgentVersions(result.items || []);
+      setSelectedVersionId(result.items?.[0]?.id || "");
+    } catch (e) {setVersionError((e as Error).message);}
+    finally {setVersionLoading(false);}
+  }
+  async function saveDraftVersion() {
+    await action(async () => {
+      await api(base + "/versions/draft", {method:"POST"});
+      const result = await api<{items:any[]}>(base + "/versions");
+      setAgentVersions(result.items || []);setSelectedVersionId(result.items?.[0]?.id || "");
+    }, "Draft version saved.");
+  }
+  async function publishCurrentDraft() {
+    await action(async () => {
+      await api(base,{method:"PATCH",body:JSON.stringify({published:true})});
+      if (versionHistoryOpen) {
+        const result = await api<{items:any[]}>(base + "/versions");
+        setAgentVersions(result.items || []);setSelectedVersionId(result.items?.[0]?.id || "");
+      }
+    },bot.published?"Published a new major version.":"Your agent is live.");
+  }
+  async function restoreMajorVersion(version: any) {
+    if (version.kind !== "major") return;
+    if (!await confirmDialog({title:`Restore version ${version.version}?`,description:"This publishes a new major version using the selected snapshot. The current version will remain in history.",confirmText:"Restore and publish",tone:"danger"})) return;
+    await action(async () => {
+      await api(base + "/versions/" + version.id + "/restore", {method:"POST"});
+      const result = await api<{items:any[]}>(base + "/versions");
+      setAgentVersions(result.items || []);setSelectedVersionId(result.items?.[0]?.id || "");
+    }, `Restored version ${version.version} as a new major version.`);
   }
   if (loadError) return <div className="error">{loadError}</div>;
   if (tab === "Workflow") return <WorkflowStudio bot={bot} notify={notify} />;
@@ -983,7 +1052,7 @@ function AgentDetail({
           name={bot.name}
           greeting={bot.widget_config.greeting}
           color={bot.widget_config.color}
-          logo={bot.widget_config.logo}
+          logo={bot.widget_config.logo?.startsWith("s3://") ? `${API}/api/v1/bots/${bot.id}/widget/logo` : bot.widget_config.logo}
           onDone={() => {
             refresh().catch(() => {});
           }}
@@ -1243,56 +1312,32 @@ function AgentDetail({
   if (tab === "Conversations")
     return data ? (
       <div className="panel conversations-panel">
-        {data.items.length ? (
+        {selectedVisitor ? (
+          <>
+            <div className="visitor-detail-heading">
+              <button className="secondary" onClick={() => {setSelectedVisitor(null);setVisitorConversations(null);setLoadError("");}}><ArrowLeft size={14}/> All users</button>
+              <div><h2>{selectedVisitor.user_name || (selectedVisitor.user_id ? "User" : "Anonymous visitor")}</h2><p>{selectedVisitor.user_id ? `User ID: ${selectedVisitor.user_id}` : `Visitor ID: ${selectedVisitor.visitor_id}`}</p></div>
+              <span>{selectedVisitor.conversation_count} conversations</span>
+            </div>
+            {visitorLoading ? <p className="visitor-loading">Loading conversations…</p> : visitorConversations?.length ? visitorConversations.map((c: any) => (
+              <details className="conversation" key={c.id}>
+                <summary><MessageSquare size={17}/><div><strong>{c.messages.find((m: any) => m.role === "user")?.content || "Conversation"}</strong><span>{new Date(c.created_at).toLocaleString()} · {c.messages.length} messages</span></div><ChevronRight size={17}/></summary>
+                <div className="conversation-messages">{c.messages.map((m: any) => <div key={m.id} className={"message " + m.role}><small>{m.role === "user" ? (c.user_name || "Visitor") : bot.name}</small><div className="message-body">{m.content}</div>{m.role === "assistant" && <details className="trace"><summary>Inspect trace · {m.latency_ms} ms · {m.tokens} tokens</summary><pre>{JSON.stringify({confidence:m.confidence,citations:m.citations,trace:m.trace,cost_cents:m.cost_cents},null,2)}</pre></details>}</div>)}</div>
+              </details>
+            )) : <Empty title="No conversations yet" text="Conversations from this user will appear here."/>}
+          </>
+        ) : data.items.length ? (
           data.items.map((c: any) => (
-            <details className="conversation" key={c.id}>
-              <summary>
-                <MessageSquare size={17} />
-                <div>
-                  <strong>
-                    {c.messages.find((m: any) => m.role === "user")?.content ||
-                      "Conversation"}
-                  </strong>
-                  <span>
-                    {new Date(c.created_at).toLocaleString()} ·{" "}
-                    {c.messages.length} messages
-                  </span>
-                </div>
-                <ChevronRight size={17} />
-              </summary>
-              <div className="conversation-messages">
-                {c.messages.map((m: any) => (
-                  <div key={m.id} className={"message " + m.role}>
-                    <small>{m.role === "user" ? "Visitor" : bot.name}</small>
-                    <div className="message-body">{m.content}</div>
-                    {m.role === "assistant" && (
-                      <details className="trace">
-                        <summary>
-                          Inspect trace · {m.latency_ms} ms · {m.tokens} tokens
-                        </summary>
-                        <pre>
-                          {JSON.stringify(
-                            {
-                              confidence: m.confidence,
-                              citations: m.citations,
-                              trace: m.trace,
-                              cost_cents: m.cost_cents,
-                            },
-                            null,
-                            2,
-                          )}
-                        </pre>
-                      </details>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </details>
+            <button className="visitor-list-row" key={c.key} onClick={() => openVisitor(c)}>
+              <span className="visitor-avatar"><UserRound size={17}/></span>
+              <span className="visitor-list-copy"><strong>{c.user_name || (c.user_id ? "User" : "Anonymous visitor")}</strong><small>{c.user_id ? `User ID: ${c.user_id}` : `Visitor ID: ${c.visitor_id}`}</small><small>Last active {new Date(c.last_seen).toLocaleString()} · {c.last_message || "No messages yet"}</small></span>
+              <span className="visitor-count">{c.conversation_count} {c.conversation_count === 1 ? "conversation" : "conversations"}</span><ChevronRight size={17}/>
+            </button>
           ))
         ) : (
           <Empty
-            title="Every conversation has a story"
-            text="Ask your agent a question to start collecting conversation history and traces."
+            title="No users yet"
+            text="When people chat with your agent, they’ll appear here with their conversation history."
           />
         )}
         <div className="pagination">
@@ -1304,7 +1349,7 @@ function AgentDetail({
             Previous
           </button>
           <span>
-            Page {page} · {data.total} conversations
+            Page {page} · {data.total} users
           </span>
           <button
             className="secondary"
@@ -1389,6 +1434,7 @@ function AgentDetail({
         ? window.location.origin + "/chat/" + bot.slug
         : "";
     return (
+      <>
       <div className="deploy-grid">
         <div className="panel deploy-panel">
           <div className="empty-icon">
@@ -1396,26 +1442,16 @@ function AgentDetail({
           </div>
           <h2>Ready for the real world?</h2>
           <p>
-            Publish your agent to enable its hosted chat page and website
-            widget.
+            Publish saved agent settings as a major release. Publishing again
+            without changes keeps the current version.
           </p>
-          <button
-            className={bot.published ? "secondary" : "primary"}
-            disabled={busy}
-            onClick={() =>
-              action(
-                () =>
-                  api(base, {
-                    method: "PATCH",
-                    body: JSON.stringify({ published: !bot.published }),
-                  }),
-                bot.published ? "Agent unpublished." : "Your agent is live.",
-              )
-            }
-          >
-            {bot.published ? "Unpublish agent" : "Publish agent"}
-            <ArrowRight size={16} />
-          </button>
+          <div className="agent-publish-controls">
+            {bot.version_history_enabled && bot.draft_needs_save && <button className="secondary" disabled={busy} onClick={() => void saveDraftVersion()}><FileText size={14}/>Save draft version</button>}
+            <button className="primary" disabled={busy || (bot.published && !bot.draft_changed)} onClick={() => void publishCurrentDraft()}>{bot.published ? bot.draft_changed ? "Publish major version" : `Published${bot.published_version ? ` · v${bot.published_version}` : ""}` : "Publish agent"}<ArrowRight size={16}/></button>
+            {bot.published && <button className="secondary" disabled={busy} onClick={() => action(() => api(base,{method:"PATCH",body:JSON.stringify({published:false})}),"Agent unpublished.")}>Unpublish</button>}
+          </div>
+          <p className="agent-publish-status">{bot.draft_changed ? "Draft changes are ready to publish." : bot.published ? `This version is live${bot.published_version ? ` · v${bot.published_version}` : ""}.` : "Publish this agent when it is ready."}</p>
+          {bot.version_history_enabled && <button className="version-history-toggle" onClick={() => void toggleVersionHistory()}>{versionHistoryOpen ? "Hide version history" : "View version history"}<ChevronRight size={14}/></button>}
           <div className="divider" />
           <label>
             Shareable chat link
@@ -1452,7 +1488,7 @@ function AgentDetail({
           <h2>At home on any website.</h2>
           <p>
             Add this script before the closing <code>&lt;/body&gt;</code> tag.
-            The widget loads only when your agent is published.
+            The widget loads only when your agent is published. Pass each signed-in visitor’s stable ID and optional display name with <code>data-user-id</code> and <code>data-user-name</code> to group their conversations.
           </p>
           <pre className="embed-code">{snippet}</pre>
           <button
@@ -1475,6 +1511,8 @@ function AgentDetail({
           </div>
         </div>
       </div>
+      {versionHistoryOpen && bot.version_history_enabled && <section className="panel agent-version-panel"><div className="section-heading"><div><h2>Agent versions</h2><p>Major versions are published releases. Minor versions are saved drafts.</p></div></div>{versionLoading ? <p className="version-state">Loading versions…</p> : versionError ? <div className="error" role="alert">{versionError}</div> : !agentVersions.length ? <p className="version-state">No saved versions yet.</p> : <><label>Choose a version<select value={selectedVersionId} onChange={event=>setSelectedVersionId(event.target.value)}>{agentVersions.map(version=><option key={version.id} value={version.id}>v{version.version} · {version.kind === "major" ? "Published" : "Draft"} · {new Date(version.created_at).toLocaleString()}</option>)}</select></label>{(()=>{const version=agentVersions.find(item=>item.id===selectedVersionId);if(!version)return null;return <div className="agent-version-details"><div><strong>Version {version.version}</strong><span className={version.kind}>{version.kind === "major" ? "Published major version" : "Saved minor draft"}</span><time>{new Date(version.created_at).toLocaleString()}</time></div><pre>{JSON.stringify(version.snapshot,null,2)}</pre>{version.kind === "major"&&<button className="secondary" disabled={busy} onClick={()=>void restoreMajorVersion(version)}><RefreshCw size={14}/>Restore and publish this version</button>}</div>;})()}</>}</section>}
+      </>
     );
   }
   if (tab === "Settings")
@@ -1497,7 +1535,8 @@ function AgentDetail({
                     color: form.get("color"),
                     greeting: form.get("greeting"),
                     position: form.get("position"),
-                    logo: form.get("logo"),
+                    logo: logoUrlInput.trim() || logoRef,
+                    launcher_icon: form.get("launcher_icon"),
                   },
                 }),
               }),
@@ -1561,16 +1600,47 @@ function AgentDetail({
               <option value="left">Bottom left</option>
             </select>
           </label>
+          <label>
+            Chat launcher icon
+            <select name="launcher_icon" defaultValue={bot.widget_config.launcher_icon || "sparkle"}>
+              <option value="sparkle">Sparkle</option>
+              <option value="message">Message bubble</option>
+              <option value="chat">Chat bubble</option>
+              <option value="headset">Headset</option>
+            </select>
+          </label>
         </div>
         <label>
           Logo URL (optional)
           <input
-            name="logo"
+            name="logo_url"
             type="url"
-            defaultValue={bot.widget_config.logo}
+            value={logoUrlInput}
+            onChange={(event) => {setLogoUrlInput(event.target.value);setLogoRef("");setLogoPreview(event.target.value);}}
             placeholder="https://example.com/logo.png"
           />
+          <small>Or upload a PNG, JPG, WEBP, or GIF image (up to 5 MB). Uploads are stored in your configured S3 bucket.</small>
         </label>
+        <div className="widget-logo-upload">
+          <label className="secondary logo-upload-button">
+            {logoUploading ? "Uploading logo…" : "Upload logo to S3"}
+            <input type="file" accept=".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp,image/gif" disabled={logoUploading || busy} onChange={async (event) => {
+              const input = event.currentTarget;
+              const file = input.files?.[0];
+              if (!file) return;
+              setLogoUploadError("");
+              setLogoUploading(true);
+              const body = new FormData(); body.append("file", file);
+              try {
+                const result = await api<{logo:string;logo_url:string}>(base + "/widget/logo", {method:"POST", body});
+                setLogoRef(result.logo); setLogoUrlInput(""); setLogoPreview(result.logo_url); notify("Logo uploaded to S3.");
+              } catch (error) { setLogoUploadError((error as Error).message); }
+              finally { setLogoUploading(false); input.value = ""; }
+            }}/>
+          </label>
+          {logoPreview && <div className="widget-logo-preview"><img src={logoPreview} alt="Agent chat logo preview"/><button type="button" className="danger" onClick={() => {setLogoRef("");setLogoUrlInput("");setLogoPreview("");}}>Remove logo</button></div>}
+          {logoUploadError && <div className="error" role="alert">{logoUploadError}</div>}
+        </div>
         <label>
           Abstention threshold
           <input

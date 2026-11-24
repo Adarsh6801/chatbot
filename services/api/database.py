@@ -61,10 +61,23 @@ class Bot(Base):
     public_key = Column(String, unique=True, default=uid, nullable=False)
     description = Column(Text, default='')
     system_prompt = Column(Text, default='Answer clearly using only the provided sources. Cite your evidence.')
-    widget_config = Column(JSON, default=lambda: {'color': '#d6ff63', 'position': 'right', 'greeting': 'Hi! What can I help you find?', 'logo': ''})
+    widget_config = Column(JSON, default=lambda: {'color': '#d6ff63', 'position': 'right', 'greeting': 'Hi! What can I help you find?', 'logo': '', 'launcher_icon': 'sparkle'})
     threshold = Column(Float, default=0.22)
     published = Column(Integer, default=0)
+    published_config = Column(JSON, nullable=True)
     created_at = Column(String, default=now)
+
+class AgentVersion(Base):
+    __tablename__ = 'agent_versions'
+    __table_args__ = (Index('ix_agent_versions_bot_created', 'bot_id', 'created_at'),)
+    id = Column(String, primary_key=True, default=uid)
+    bot_id = Column(String, ForeignKey('bots.id'), nullable=False, index=True)
+    created_by = Column(String, ForeignKey('users.id'), nullable=False)
+    major = Column(Integer, nullable=False)
+    minor = Column(Integer, nullable=False, default=0)
+    kind = Column(String, nullable=False)
+    snapshot = Column(JSON, nullable=False)
+    created_at = Column(String, default=now, nullable=False)
 
 class Document(Base):
     __tablename__ = 'documents'
@@ -95,6 +108,8 @@ class Conversation(Base):
     id = Column(String, primary_key=True, default=uid)
     bot_id = Column(String, ForeignKey('bots.id'), nullable=False, index=True)
     visitor_id = Column(String, nullable=False)
+    user_id = Column(String, nullable=True, index=True)
+    user_name = Column(String, nullable=True)
     workflow_state = Column(JSON, default=dict)
     created_at = Column(String, default=now)
 

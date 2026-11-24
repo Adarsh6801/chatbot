@@ -44,12 +44,15 @@ def list_tickets(db: Session = Depends(get_db), user: User = Depends(current_use
 
 @router.post("/tickets", status_code=201)
 def create_ticket(body: TicketCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(422, "Message cannot be blank.")
     ticket = SupportTicket(user_id=user.id, subject=body.subject.strip(), status="open", admin_unread=1, user_unread=0)
     if len(ticket.subject) < 3:
         raise HTTPException(422, "Subject must contain at least 3 characters.")
     db.add(ticket)
     db.flush()
-    db.add(SupportTicketMessage(ticket_id=ticket.id, author_id=user.id, author_role="user", body=body.message.strip()))
+    db.add(SupportTicketMessage(ticket_id=ticket.id, author_id=user.id, author_role="user", body=message))
     ticket.updated_at = now()
     db.commit()
     return ticket_item(db, ticket)

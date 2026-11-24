@@ -1,15 +1,16 @@
 """Global platform administration endpoints, isolated from workspace APIs."""
-import os
+import os, json, struct, asyncio
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Request, Response
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .config import PLANS
-from .database import AdminAudit, ApiKey, AppSetting, Bot, Conversation, Document, LoginSession, Message, SupportTicket, SupportTicketMessage, User, get_db, now
+from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, Bot, Conversation, Document, LoginSession, Message, SupportTicket, SupportTicketMessage, User, get_db, now
 from .payment_settings import get_payment_provider, payment_provider_status
 from .security import current_user
+from .providers import store_site_logo, read_site_logo
 
 router = APIRouter(prefix="/api/v1/admin", tags=["platform administration"])
 
@@ -36,6 +37,17 @@ class AgentUpdate(BaseModel):
 
 class PaymentProviderUpdate(BaseModel):
     provider: str
+
+
+class SiteSettingsUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    logo: str | None = None
+
+    @field_validator('name')
+    @classmethod
+    def clean_site_name(cls, value):
+        if not value.strip(): raise ValueError('Application name cannot be blank.')
+        return value.strip()
 
 
 class SupportReply(BaseModel):
@@ -90,6 +102,67 @@ def update_payment_settings(body: PaymentProviderUpdate, db: Session = Depends(g
         write_audit(db, admin, "payment_provider.changed", "payment_provider", body.provider, {"from": previous, "to": body.provider})
     db.commit()
     return {"provider": body.provider, "providers": status}
+
+
+def get_site_branding(db: Session) -> dict:
+    setting = db.get(AppSetting, "site_branding")
+    try: data = json.loads(setting.value) if setting else {}
+    except (TypeError, json.JSONDecodeError): data = {}
+    return {"name": str(data.get("name") or "AgentForge"), "logo": str(data.get("logo") or "")}
+
+
+@router.get("/settings/site")
+def site_settings(request: Request, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    branding = get_site_branding(db)
+    logo_url = str(request.base_url).rstrip('/') + "/api/v1/admin/settings/site/logo" if branding["logo"] else ""
+    return {"name":branding["name"],"logo_url":logo_url,"has_logo":bool(branding["logo"])}
+
+
+@router.put("/settings/site")
+def update_site_settings(body: SiteSettingsUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    current = get_site_branding(db)
+    logo = current["logo"] if body.logo is None else body.logo.strip()
+    bucket = os.getenv('S3_BUCKET')
+    if logo and (not bucket or not logo.startswith(f's3://{bucket}/site-assets/branding/')):
+        raise HTTPException(422,"Choose a logo uploaded to this workspace's S3 bucket.")
+    setting = db.get(AppSetting,"site_branding")
+    value = json.dumps({"name":body.name,"logo":logo},separators=(',',':'))
+    if setting: setting.value,setting.updated_at = value,now()
+    else: db.add(AppSetting(key="site_branding",value=value))
+    write_audit(db,admin,"site_branding.updated","site_settings","site_branding",{"name":body.name,"logo_updated":logo != current["logo"]})
+    db.commit()
+    return {"name":body.name,"has_logo":bool(logo)}
+
+
+@router.post("/settings/site/logo")
+async def upload_site_logo(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    if not os.getenv('S3_BUCKET'): raise HTTPException(503,"Configure S3_BUCKET before uploading a site logo.")
+    raw = await file.read(2 * 1024 * 1024 + 1)
+    valid_png = len(raw) >= 24 and raw.startswith(b'\x89PNG\r\n\x1a\n') and struct.unpack('>II',raw[16:24]) == (256,256)
+    if len(raw) > 2 * 1024 * 1024 or not valid_png:
+        raise HTTPException(422,"Upload a logo cropped to a 256 × 256 PNG image.")
+    try: logo = await asyncio.to_thread(store_site_logo,raw)
+    except Exception:
+        raise HTTPException(502,"Logo upload failed. Check the S3 connection and try again.")
+    branding = get_site_branding(db); branding["logo"] = logo
+    setting = db.get(AppSetting,"site_branding")
+    value = json.dumps(branding,separators=(',',':'))
+    if setting: setting.value,setting.updated_at = value,now()
+    else: db.add(AppSetting(key="site_branding",value=value))
+    write_audit(db,admin,"site_branding.logo_uploaded","site_settings","site_branding",{"bytes":len(raw)})
+    db.commit()
+    logo_url = str(request.base_url).rstrip('/') + "/api/v1/admin/settings/site/logo"
+    return {"logo_url":logo_url,"has_logo":True}
+
+
+@router.get("/settings/site/logo")
+def admin_site_logo(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    logo = get_site_branding(db)["logo"]
+    if not logo: raise HTTPException(404,"No site logo has been uploaded.")
+    try: content, content_type = read_site_logo(logo)
+    except Exception: raise HTTPException(502,"Site logo storage is unavailable.")
+    if content_type != "image/png": raise HTTPException(404,"Site logo not found.")
+    return Response(content,media_type="image/png",headers={"Cache-Control":"private, max-age=3600","X-Content-Type-Options":"nosniff"})
 
 
 @router.get("/users")
@@ -168,6 +241,15 @@ def update_agent(bot_id: str, body: AgentUpdate, db: Session = Depends(get_db), 
         raise HTTPException(404, "Agent not found.")
     if bool(bot.published) != body.published:
         owner = db.get(User, bot.user_id)
+        if body.published:
+            widget = dict(bot.widget_config or {})
+            for key,value in {'color':'#d6ff63','position':'right','greeting':'Hi! What can I help you find?','logo':'','launcher_icon':'sparkle'}.items(): widget.setdefault(key,value)
+            snapshot = {'name':bot.name,'description':bot.description or '','system_prompt':bot.system_prompt or '','threshold':bot.threshold,'widget_config':widget}
+            has_major = db.query(AgentVersion).filter_by(bot_id=bot.id,kind='major').count() > 0
+            if not has_major or bot.published_config != snapshot:
+                major = db.query(func.max(AgentVersion.major)).filter_by(bot_id=bot.id,kind='major').scalar() or 0
+                db.add(AgentVersion(bot_id=bot.id,created_by=admin.id,major=major+1,minor=0,kind='major',snapshot=snapshot))
+                bot.published_config = snapshot
         bot.published = int(body.published)
         write_audit(db, admin, "agent.published" if body.published else "agent.unpublished", "agent", bot.id,
                     {"name": bot.name, "owner_email": owner.email if owner else None})

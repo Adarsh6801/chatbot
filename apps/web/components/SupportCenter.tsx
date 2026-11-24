@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { ArrowLeft, Clock3, LifeBuoy, LoaderCircle, MessageCircle, Plus, Send } from "lucide-react";
 import { api } from "@/lib/api";
+import { SupportEditor, SupportMessageView } from "@/components/SupportRichText";
 import "@/components/support.css";
 
 type Ticket = { id: string; subject: string; status: string; created_at: string; updated_at: string; unread: boolean; last_message: string; last_author_role: string };
@@ -40,7 +41,7 @@ export default function SupportCenter() {
   }, [loadTickets, loadTicket, selected?.id]);
 
   async function create(event: FormEvent) {
-    event.preventDefault(); setBusy(true); setError("");
+    event.preventDefault(); if (!message.trim()) { setError("Message cannot be blank."); return; } setBusy(true); setError("");
     try {
       const ticket = await api<Ticket>("/support/tickets", { method: "POST", body: JSON.stringify({ subject, message }) });
       setSubject(""); setMessage(""); setComposing(false);
@@ -49,7 +50,7 @@ export default function SupportCenter() {
     finally { setBusy(false); }
   }
   async function sendReply(event: FormEvent) {
-    event.preventDefault(); if (!selected) return;
+    event.preventDefault(); if (!selected) return; if (!reply.trim()) { setError("Reply cannot be blank."); return; }
     setBusy(true); setError("");
     try {
       await api(`/support/tickets/${selected.id}/messages`, { method: "POST", body: JSON.stringify({ message: reply }) });
@@ -66,8 +67,8 @@ export default function SupportCenter() {
         {!tickets.length ? <div className="support-list-empty"><LifeBuoy size={22}/><p>No support tickets yet.</p></div> : tickets.map((ticket) => <button className={`support-ticket-row ${selected?.id === ticket.id ? "selected" : ""}`} key={ticket.id} onClick={() => { setComposing(false); void loadTicket(ticket.id, true).catch((e) => setError(e.message)); }}><span className="support-ticket-row-top"><strong>{ticket.subject}</strong>{ticket.unread && <i aria-label="New reply"/>}</span><span className="support-ticket-preview">{ticket.last_message}</span><span className="support-ticket-row-bottom"><span className={`support-status ${ticket.status}`}>{statusLabel[ticket.status] || ticket.status}</span><time>{dateLabel(ticket.updated_at)}</time></span></button>)}
       </aside>
       <main className="support-thread panel">
-        {composing ? <form className="support-compose" onSubmit={create}><button type="button" className="support-back" onClick={() => setComposing(false)}><ArrowLeft size={15}/>Back to tickets</button><h2>Start a support ticket</h2><p>Describe what you need help with. The support team will be notified in the admin console.</p><label>Subject<input value={subject} onChange={(e) => setSubject(e.target.value)} required minLength={3} maxLength={160} placeholder="Briefly describe your issue"/></label><label>Message<textarea value={message} onChange={(e) => setMessage(e.target.value)} required maxLength={10000} rows={7} placeholder="Include details that will help us investigate…"/></label><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="support-spin" size={15}/> : <Send size={15}/>}Send ticket</button></form>
-        : selected ? <><header className="support-thread-heading"><div><span className="eyebrow">TICKET · {selected.id.slice(0, 8).toUpperCase()}</span><h2>{selected.subject}</h2><span className={`support-status ${selected.status}`}>{statusLabel[selected.status] || selected.status}</span></div><button className="support-back" onClick={() => setSelected(null)}><ArrowLeft size={15}/>All tickets</button></header><div className="support-messages">{selected.messages.map((item) => <article key={item.id} className={`support-message ${item.author_role}`}><div className="support-message-meta"><strong>{item.author_name}</strong><time>{dateLabel(item.created_at)}</time></div><p>{item.body}</p></article>)}</div><form className="support-reply" onSubmit={sendReply}><textarea value={reply} onChange={(e) => setReply(e.target.value)} maxLength={10000} rows={3} required placeholder="Write a reply…"/><div><span><Clock3 size={13}/>Replies update this ticket automatically.</span><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="support-spin" size={15}/> : <Send size={15}/>}Reply</button></div></form></>
+        {composing ? <form className="support-compose" onSubmit={create}><button type="button" className="support-back" onClick={() => setComposing(false)}><ArrowLeft size={15}/>Back to tickets</button><h2>Start a support ticket</h2><p>Describe what you need help with. The support team will be notified in the admin console.</p><label>Subject<input value={subject} onChange={(e) => setSubject(e.target.value)} required minLength={3} maxLength={160} placeholder="Briefly describe your issue"/></label><div className="support-compose-field"><span>Message</span><SupportEditor value={message} onChange={setMessage} maxLength={10000} rows={7} placeholder="Include details that will help us investigate…"/></div><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="support-spin" size={15}/> : <Send size={15}/>}Send ticket</button></form>
+        : selected ? <><header className="support-thread-heading"><div><span className="eyebrow">TICKET · {selected.id.slice(0, 8).toUpperCase()}</span><h2>{selected.subject}</h2><span className={`support-status ${selected.status}`}>{statusLabel[selected.status] || selected.status}</span></div><button className="support-back" onClick={() => setSelected(null)}><ArrowLeft size={15}/>All tickets</button></header><div className="support-messages">{selected.messages.map((item) => <article key={item.id} className={`support-message ${item.author_role}`}><div className="support-message-meta"><strong>{item.author_name}</strong><time>{dateLabel(item.created_at)}</time></div><SupportMessageView text={item.body}/></article>)}</div><form className="support-reply" onSubmit={sendReply}><SupportEditor value={reply} onChange={setReply} maxLength={10000} rows={3} placeholder="Write a reply…"/><div><span><Clock3 size={13}/>Replies update this ticket automatically.</span><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="support-spin" size={15}/> : <Send size={15}/>}Reply</button></div></form></>
         : <div className="support-thread-empty"><MessageCircle size={30}/><h2>{tickets.length ? "Open a ticket" : "How can we help?"}</h2><p>Select a ticket to read the conversation, or create a new one to contact support.</p><button className="secondary" onClick={() => setComposing(true)}><Plus size={15}/>Create a ticket</button></div>}
       </main>
     </div>

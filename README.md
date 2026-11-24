@@ -74,6 +74,7 @@ Create an account with a password of at least 10 characters. Click **Try a demo*
 - Redis/Celery workers with persisted-job recovery, optional S3/R2 raw storage, Langfuse trace export, responsive Next.js dashboard, tests, CI and Docker Compose.
 - User profiles with Google account linking, a visible account menu/logout, subscription controls, and an in-app service setup guide.
 - Visual Workflow Studio with drag-and-connect nodes, intents, captured variables, conditions, protected API calls, knowledge retrieval, draft testing, versioned publishing and optional execution in live chat.
+- Change-aware agent publishing: only changed settings create a new published major version. Subscribers can save minor draft snapshots, inspect history, and restore a prior published major version.
 
 See [workflow guide](docs/WORKFLOWS.md) for configuration and runtime behavior.
 
@@ -94,7 +95,7 @@ Copy `.env.example` to `.env` at the repository root. The API reads this file on
 | `COHERE_API_KEY` | Enable cross-encoder reranking |
 | `EMBEDDING_PROVIDER=openai` | Use OpenAI semantic embeddings; default `local` |
 | `REDIS_URL` | Enable Celery queue and Redis rate limiting; Compose configures this |
-| `S3_BUCKET`, `S3_ENDPOINT_URL`, `AWS_*` | Optional raw file storage in S3 or R2 |
+| `S3_BUCKET`, `S3_ENDPOINT_URL`, `AWS_*` | S3 or R2 storage for uploaded knowledge files, agent logos, and the site logo |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST` | Optional external trace export |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Optional Google OAuth |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Fallback if OpenAI fails before delivering text |
@@ -113,10 +114,12 @@ Create monthly recurring Pro and Team plans in Razorpay and place their plan IDs
 
 ```html
 <script src="http://localhost:8000/widget.js"
-        data-agent-key="YOUR_PUBLISHED_AGENT_PUBLIC_KEY" async></script>
+        data-agent-key="YOUR_PUBLISHED_AGENT_PUBLIC_KEY"
+        data-user-id="YOUR_CURRENT_VISITOR_ID"
+        data-user-name="YOUR_CURRENT_VISITOR_NAME" async></script>
 ```
 
-Use HTTPS URLs when embedding on an HTTPS site. The published widget is an iframe of the hosted chat page and works without owner session cookies.
+Pass the current visitor's stable ID in `data-user-id` (and optionally their display name in `data-user-name`) to group multiple conversations under that user in the agent's Conversations tab. Omit these attributes for anonymous visitors. Render the values per signed-in visitor; do not use one shared ID for every site visitor. The hosted chat also accepts `user_id` and `user_name` query parameters. It restores the latest conversation for the same browser visitor after refresh; **New chat** starts a separate conversation and keeps that blank session on refresh until the visitor sends a message. Use HTTPS URLs when embedding on an HTTPS site. The published widget is an iframe of the hosted chat page and works without owner session cookies.
 
 ## Verify
 

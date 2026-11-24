@@ -75,3 +75,51 @@ def store_raw(document_id, name, raw):
     extra = {} if os.getenv('S3_ENDPOINT_URL') else {'ServerSideEncryption':'AES256'}
     client.put_object(Bucket=bucket, Key=key, Body=raw, ContentType='application/octet-stream', **extra)
     return 's3://' + bucket + '/' + key
+
+def store_widget_logo(bot_id, extension, raw, content_type):
+    bucket = os.getenv('S3_BUCKET')
+    if not bucket: raise RuntimeError('S3_BUCKET is not configured')
+    import boto3, uuid
+    client = boto3.client('s3', endpoint_url=os.getenv('S3_ENDPOINT_URL') or None)
+    key = f'agent-assets/{bot_id}/logos/{uuid.uuid4().hex}.{extension}'
+    extra = {'ContentType': content_type, 'CacheControl': 'public, max-age=3600'}
+    if not os.getenv('S3_ENDPOINT_URL'): extra['ServerSideEncryption'] = 'AES256'
+    client.put_object(Bucket=bucket, Key=key, Body=raw, **extra)
+    return f's3://{bucket}/{key}'
+
+def read_widget_logo(uri):
+    bucket = os.getenv('S3_BUCKET')
+    if not bucket or not uri.startswith(f's3://{bucket}/agent-assets/'):
+        raise FileNotFoundError('Logo object not found')
+    import boto3
+    _, _, object_path = uri.partition(f's3://{bucket}/')
+    response = boto3.client('s3', endpoint_url=os.getenv('S3_ENDPOINT_URL') or None).get_object(Bucket=bucket, Key=object_path)
+    return response['Body'].read(), response.get('ContentType', 'application/octet-stream')
+
+def store_site_logo(raw):
+    bucket = os.getenv('S3_BUCKET')
+    if not bucket: raise RuntimeError('S3_BUCKET is not configured')
+    import boto3, uuid
+    client = boto3.client('s3', endpoint_url=os.getenv('S3_ENDPOINT_URL') or None)
+    key = f'site-assets/branding/{uuid.uuid4().hex}.png'
+    extra = {'ContentType':'image/png','CacheControl':'public, max-age=3600'}
+    if not os.getenv('S3_ENDPOINT_URL'): extra['ServerSideEncryption'] = 'AES256'
+    client.put_object(Bucket=bucket,Key=key,Body=raw,**extra)
+    return f's3://{bucket}/{key}'
+
+def read_site_logo(uri):
+    bucket = os.getenv('S3_BUCKET')
+    if not bucket or not uri.startswith(f's3://{bucket}/site-assets/branding/'):
+        raise FileNotFoundError('Site logo not found')
+    import boto3
+    _, _, key = uri.partition(f's3://{bucket}/')
+    response = boto3.client('s3',endpoint_url=os.getenv('S3_ENDPOINT_URL') or None).get_object(Bucket=bucket,Key=key)
+    return response['Body'].read(),response.get('ContentType','application/octet-stream')
+
+def delete_widget_logo(uri):
+    bucket = os.getenv('S3_BUCKET')
+    if not bucket or not uri.startswith(f's3://{bucket}/agent-assets/'):
+        return
+    import boto3
+    _, _, object_path = uri.partition(f's3://{bucket}/')
+    boto3.client('s3', endpoint_url=os.getenv('S3_ENDPOINT_URL') or None).delete_object(Bucket=bucket, Key=object_path)

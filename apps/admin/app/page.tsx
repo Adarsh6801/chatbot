@@ -3,18 +3,30 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
-import { Activity, Bot, ChevronLeft, ChevronRight, CircleHelp, CreditCard, LayoutDashboard, LogOut, MessageSquareText, RefreshCw, Search, Shield, ShieldAlert, Users, X } from "lucide-react";
+import { Activity, Bot, ChevronLeft, ChevronRight, CircleHelp, CreditCard, LayoutDashboard, LogOut, MessageSquareText, RefreshCw, Search, Shield, ShieldAlert, Users, X, Settings2, Upload, Image as ImageIcon } from "lucide-react";
 import { api } from "@/lib/api";
 import type { AdminAgent, AdminUser, AuditEvent } from "@/lib/api";
+import { SupportEditor, SupportMessageView } from "./SupportRichText";
 import "./payments.css";
 
 type Admin = { id: string; name: string; email: string; is_admin: boolean };
-type View = "overview" | "users" | "agents" | "conversations" | "tickets" | "activity" | "payments";
+type View = "overview" | "users" | "agents" | "conversations" | "tickets" | "activity" | "payments" | "site";
 type PageResult<T> = { items: T[]; total: number; page: number; limit: number };
-const labels: Record<View, string> = { overview: "Dashboard", users: "Users", agents: "Agents", conversations: "Conversations", tickets: "Support tickets", activity: "Admin activity", payments: "Payment provider" };
+const labels: Record<View, string> = { overview: "Dashboard", users: "Users", agents: "Agents", conversations: "Conversations", tickets: "Support tickets", activity: "Admin activity", payments: "Payment provider", site: "Site settings" };
 
 function date(value?: string) { return value ? new Date(value).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "—"; }
 function Badge({ children, tone = "gray" }: { children: ReactNode; tone?: "gray" | "green" | "red" | "amber" }) { return <span className={`badge ${tone}`}>{children}</span>; }
+
+async function cropSiteLogo(file: File): Promise<Blob> {
+  if (file.size > 10 * 1024 * 1024) throw new Error("Choose an image under 10 MB.");
+  const bitmap = await createImageBitmap(file);
+  const side = Math.min(bitmap.width, bitmap.height);
+  const canvas = document.createElement("canvas");canvas.width=256;canvas.height=256;
+  const context = canvas.getContext("2d");
+  if (!context) {bitmap.close();throw new Error("Your browser could not crop this image.");}
+  context.drawImage(bitmap,(bitmap.width-side)/2,(bitmap.height-side)/2,side,side,0,0,256,256);bitmap.close();
+  return await new Promise((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error("Could not create the cropped logo.")),"image/png"));
+}
 
 export default function AdminConsole() {
   const [admin, setAdmin] = useState<Admin | null>(null);
@@ -23,6 +35,10 @@ export default function AdminConsole() {
   const [view, setView] = useState<View>("overview");
   const [overview, setOverview] = useState<any>(null);
   const [paymentSettings, setPaymentSettings] = useState<any>(null);
+  const [siteSettings, setSiteSettings] = useState<{name:string;logo_url:string;has_logo:boolean}>({name:"AgentForge",logo_url:"",has_logo:false});
+  const [siteName, setSiteName] = useState("AgentForge");
+  const [siteLogoChanged, setSiteLogoChanged] = useState(false);
+  const [siteLogoUploading, setSiteLogoUploading] = useState(false);
   const [rows, setRows] = useState<PageResult<any> | null>(null);
   const [page, setPage] = useState(1);
   const [query, setQuery] = useState("");
@@ -39,6 +55,10 @@ export default function AdminConsole() {
 
   const refreshOverview = useCallback(async () => setOverview(await api("/admin/overview")), []);
   const refreshPaymentSettings = useCallback(async () => setPaymentSettings(await api("/admin/settings/payment-provider")), []);
+  const refreshSiteSettings = useCallback(async () => {
+    const result = await api<{name:string;logo_url:string;has_logo:boolean}>("/admin/settings/site");
+    setSiteSettings(result);setSiteName(result.name);setSiteLogoChanged(false);
+  }, []);
   const refreshRows = useCallback(async (activeView: View, activePage: number, q: string) => {
     const path = activeView === "users" ? "/admin/users" : activeView === "agents" ? "/admin/agents" : activeView === "conversations" ? "/admin/conversations" : activeView === "tickets" ? "/admin/support/tickets" : "/admin/audit";
     const params = new URLSearchParams({ page: String(activePage), limit: "25" });
@@ -49,6 +69,9 @@ export default function AdminConsole() {
   }, []);
 
   useEffect(() => {
+    api<{name:string;logo_url:string}>('/public/site-settings').then(branding=>{
+      setSiteName(branding.name);setSiteSettings(current=>({...current,name:branding.name,logo_url:branding.logo_url,has_logo:!!branding.logo_url}));
+    }).catch(() => {});
     api<Admin>("/auth/me").then((me) => {
       if (me.is_admin) setAdmin(me);
       else { setDenied(true); api("/auth/logout", { method: "POST" }).catch(() => {}); }
@@ -58,9 +81,12 @@ export default function AdminConsole() {
   useEffect(() => {
     if (!admin) return;
     setError("");
-    const task = view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : refreshRows(view, page, submittedQuery);
+    const task = view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : view === "site" ? refreshSiteSettings() : refreshRows(view, page, submittedQuery);
     task.catch((e) => setError(e.message));
-  }, [admin, view, page, submittedQuery, refreshOverview, refreshPaymentSettings, refreshRows]);
+  }, [admin, view, page, submittedQuery, refreshOverview, refreshPaymentSettings, refreshSiteSettings, refreshRows]);
+
+  useEffect(() => {if (admin) void refreshSiteSettings().catch((e) => setError(e.message));}, [admin, refreshSiteSettings]);
+  useEffect(() => {if (typeof document !== "undefined") document.title = `${siteSettings.name} Admin`;}, [siteSettings.name]);
 
   useEffect(() => {
     if (!admin) return;
@@ -138,6 +164,24 @@ export default function AdminConsole() {
     finally { setBusy(false); }
   }
 
+  async function saveSiteSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();setBusy(true);setError("");
+    try {
+      await api("/admin/settings/site",{method:"PUT",body:JSON.stringify({name:siteName,logo:siteLogoChanged?"":undefined})});
+      await refreshSiteSettings();setError("");
+    } catch(e) {setError((e as Error).message);} finally {setBusy(false);}
+  }
+
+  async function uploadSiteLogo(file: File) {
+    setSiteLogoUploading(true);setError("");
+    try {
+      const cropped = await cropSiteLogo(file);
+      const form = new FormData();form.append("file",new File([cropped],"site-logo.png",{type:"image/png"}));
+      const result = await api<{logo_url:string}>("/admin/settings/site/logo",{method:"POST",body:form});
+      setSiteSettings(current=>({...current,logo_url:result.logo_url,has_logo:true}));setSiteLogoChanged(false);
+    } catch(e) {setError((e as Error).message);} finally {setSiteLogoUploading(false);}
+  }
+
   async function openConversation(id: string, title: string) {
     try { setTranscript({ title, messages: await api(`/admin/conversations/${id}`) }); }
     catch (e) { setError((e as Error).message); }
@@ -154,6 +198,7 @@ export default function AdminConsole() {
 
   async function sendSupportReply(event: FormEvent) {
     event.preventDefault(); if (!supportThread) return;
+    if (!supportReply.trim()) { setError("Reply cannot be blank."); return; }
     setBusy(true); setError("");
     try {
       await api(`/admin/support/tickets/${supportThread.id}/messages`, { method: "POST", body: JSON.stringify({ message: supportReply }) });
@@ -176,20 +221,20 @@ export default function AdminConsole() {
   }
 
   if (checking) return <div className="center"><div className="loader"/>Checking secure admin session…</div>;
-  if (!admin) return <main className="login-page"><div className="login-card"><div className="logo"><Shield size={22}/></div><p className="eyebrow">AGENTFORGE · PLATFORM</p><h1>Admin console</h1><p className="subtle">Sign in with the account configured as the platform administrator.</p>{denied && <div className="error-box"><ShieldAlert size={17}/><span>{loginError || "This account is not authorized for the admin console."}</span></div>}<form onSubmit={login}><label>Email<input name="email" type="email" autoComplete="username" required/></label><label>Password<input name="password" type="password" autoComplete="current-password" required/></label>{loginError && !denied && <div className="error-box">{loginError}</div>}<button className="primary wide" disabled={busy}>{busy ? "Signing in…" : "Sign in securely"}<ChevronRight size={16}/></button></form><p className="login-foot"><Shield size={14}/> Admin access is enforced by the API.</p></div></main>;
+  if (!admin) return <main className="login-page"><div className="login-card"><div className="logo">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt=""/>:<Shield size={22}/>}</div><p className="eyebrow">{siteName.toUpperCase()} · PLATFORM</p><h1>Admin console</h1><p className="subtle">Sign in with the account configured as the platform administrator.</p>{denied && <div className="error-box"><ShieldAlert size={17}/><span>{loginError || "This account does not have global administrator access."}</span></div>}<form onSubmit={login}><label>Email<input name="email" type="email" autoComplete="username" required/></label><label>Password<input name="password" type="password" autoComplete="current-password" required/></label>{loginError && !denied && <div className="error-box">{loginError}</div>}<button className="primary wide" disabled={busy}>{busy ? "Signing in…" : "Sign in securely"}<ChevronRight size={16}/></button></form><p className="login-foot"><Shield size={14}/> Admin access is enforced by the API.</p></div></main>;
 
-  const nav: { id: View; icon: LucideIcon }[] = [{ id: "overview", icon: LayoutDashboard }, { id: "users", icon: Users }, { id: "agents", icon: Bot }, { id: "conversations", icon: MessageSquareText }, { id: "tickets", icon: CircleHelp }, { id: "payments", icon: CreditCard }, { id: "activity", icon: Activity }];
+  const nav: { id: View; icon: LucideIcon }[] = [{ id: "overview", icon: LayoutDashboard }, { id: "users", icon: Users }, { id: "agents", icon: Bot }, { id: "conversations", icon: MessageSquareText }, { id: "tickets", icon: CircleHelp }, { id: "payments", icon: CreditCard }, { id: "activity", icon: Activity }, { id: "site", icon: Settings2 }];
   const pages = Math.max(1, Math.ceil((rows?.total || 0) / (rows?.limit || 25)));
 
   return <div className="shell">
     <aside className="sidebar">
-      <div className="brand"><div className="brand-mark"><Shield size={19}/></div><div><strong>AgentForge</strong><small>Platform admin</small></div></div>
+      <div className="brand"><div className="brand-mark">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt=""/>:<Shield size={19}/>}</div><div><strong>{siteSettings.name}</strong><small>Platform admin</small></div></div>
       <div className="side-caption">CONTROL CENTER</div>
       <nav>{nav.map(({ id, icon: Icon }) => <button key={id} className={view === id ? "selected" : ""} onClick={() => { setView(id); setPage(1); setRows(null); }}><Icon size={18}/>{labels[id]}{id === "users" && overview && <span className="nav-badge">{overview.users}</span>}{id === "tickets" && supportUnread > 0 && <span className="nav-badge">{supportUnread}</span>}</button>)}</nav>
       <div className="sidebar-bottom"><div className="admin-chip"><div className="avatar">{admin.name?.[0]?.toUpperCase() || "A"}</div><div><strong>{admin.name}</strong><small>Super administrator</small></div></div><button className="logout" onClick={logout}><LogOut size={16}/>Sign out</button></div>
     </aside>
     <main className="main">
-      <header className="topbar"><div><span className="crumb">Platform</span><ChevronRight size={14}/><strong>{labels[view]}</strong></div><div className="top-actions"><span className="secure"><i/> Private admin</span><button className="icon-button" title="Refresh" onClick={() => (view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : refreshRows(view, page, submittedQuery)).catch(e => setError(e.message))}><RefreshCw size={16}/></button><div className="avatar small">{admin.name?.[0]?.toUpperCase() || "A"}</div></div></header>
+      <header className="topbar"><div><span className="crumb">Platform</span><ChevronRight size={14}/><strong>{labels[view]}</strong></div><div className="top-actions"><span className="secure"><i/> Private admin</span><button className="icon-button" title="Refresh" onClick={() => (view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : view === "site" ? refreshSiteSettings() : refreshRows(view, page, submittedQuery)).catch(e => setError(e.message))}><RefreshCw size={16}/></button><div className="avatar small">{admin.name?.[0]?.toUpperCase() || "A"}</div></div></header>
       <div className="content">
         {ticketNotice && <div className="ticket-notice"><CircleHelp size={16}/><span>{ticketNotice}</span><button onClick={()=>setTicketNotice("")} aria-label="Dismiss notification"><X size={14}/></button></div>}
         {error && <div className="error-banner"><CircleHelp size={16}/>{error}<button onClick={() => setError("")}><X size={15}/></button></div>}
@@ -200,10 +245,11 @@ export default function AdminConsole() {
         {view === "tickets" && <><PageHeading eyebrow="CUSTOMER CARE" title="Support tickets" description="Reply to customer requests, update ticket status, and follow the full message thread."/><SearchBar query={query} setQuery={setQuery} onSearch={() => { setSubmittedQuery(query.trim()); setPage(1); }}/><SupportTicketTable rows={rows?.items || []} onOpen={openSupportTicket}/><Pager page={page} pages={pages} setPage={setPage} total={rows?.total || 0}/></>}
         {view === "activity" && <><PageHeading eyebrow="SECURITY & ACCOUNTABILITY" title="Admin activity" description="A timestamped record of global administrator actions."/><AuditTable rows={rows?.items || []}/><Pager page={page} pages={pages} setPage={setPage} total={rows?.total || 0}/></>}
         {view === "payments" && <><PageHeading eyebrow="BILLING CONTROL" title="Payment provider" description="Choose the gateway customers use for new paid-plan checkouts."/><PaymentSettings data={paymentSettings} busy={busy} onSelect={selectPaymentProvider}/></>}
+        {view === "site" && <><PageHeading eyebrow="BRAND IDENTITY" title="Site settings" description="Set the application name and logo shown throughout the website and admin panel."/><form className="panel site-settings-panel" onSubmit={saveSiteSettings}><label>Application name<input value={siteName} onChange={event=>setSiteName(event.target.value)} maxLength={80} required/></label><div className="site-logo-settings"><div><h2>Application logo</h2><p>Upload an image and we’ll center-crop it to a fixed 256 × 256 PNG for consistent display.</p></div><div className="site-logo-preview">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt="Application logo preview"/>:<span><ImageIcon size={25}/></span>}</div></div><label className="site-logo-upload secondary"><Upload size={15}/>{siteLogoUploading?"Cropping and uploading…":"Choose logo image"}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={siteLogoUploading||busy} onChange={event=>{const file=event.currentTarget.files?.[0];if(file)void uploadSiteLogo(file);event.currentTarget.value="";}}/></label><small className="site-logo-help">PNG, JPG, WEBP, or GIF · maximum 10 MB · center-cropped to 256 × 256</small>{siteSettings.has_logo&&!siteLogoChanged&&<button type="button" className="danger-outline site-logo-remove" onClick={()=>{setSiteSettings(current=>({...current,has_logo:false,logo_url:""}));setSiteLogoChanged(true);}}>Remove logo</button>}{siteLogoChanged&&<p className="site-logo-pending">Logo removal will take effect when you save.</p>}<div className="site-settings-footer"><span>Branding changes appear across the public site after the next page load.</span><button className="primary" disabled={busy||siteLogoUploading}>Save site settings</button></div></form></>}
       </div>
     </main>
     {transcript && <div className="modal-backdrop" onClick={() => setTranscript(null)}><section className="transcript-modal" onClick={e => e.stopPropagation()}><header><div><p className="eyebrow">CONVERSATION TRANSCRIPT</p><h2>{transcript.title}</h2></div><button className="icon-button" onClick={() => setTranscript(null)}><X size={18}/></button></header><div className="transcript-body">{transcript.messages.map((m:any)=><article key={m.id} className={`chat-line ${m.role}`}><small>{m.role === "user" ? "Visitor" : "Agent"} · {date(m.created_at)}</small><p>{m.content}</p>{m.citations?.length > 0 && <details><summary>{m.citations.length} citations</summary>{m.citations.map((c:any,i:number)=><p className="citation" key={i}>{c.source}: {c.excerpt}</p>)}</details>}</article>)}</div></section></div>}
-    {supportThread && <div className="modal-backdrop" onClick={() => setSupportThread(null)}><section className="support-admin-modal" onClick={e => e.stopPropagation()}><header><div><p className="eyebrow">SUPPORT TICKET · {supportThread.id.slice(0,8).toUpperCase()}</p><h2>{supportThread.subject}</h2><p className="subtle">{supportThread.user_name} · {supportThread.user_email}</p></div><button className="icon-button" onClick={() => setSupportThread(null)}><X size={18}/></button></header><div className="support-admin-controls"><label>Status<select disabled={busy} value={supportThread.status} onChange={e=>void changeSupportStatus(e.target.value)}><option value="open">Open</option><option value="in_progress">In progress</option><option value="waiting_on_user">Waiting on user</option><option value="resolved">Resolved</option><option value="closed">Closed</option></select></label><span>Updated {date(supportThread.updated_at)}</span></div><div className="support-admin-messages">{supportThread.messages.map((m:any)=><article key={m.id} className={`admin-ticket-message ${m.author_role}`}><small>{m.author_name} · {date(m.created_at)}</small><p>{m.body}</p></article>)}</div><form className="support-admin-reply" onSubmit={sendSupportReply}><textarea value={supportReply} onChange={e=>setSupportReply(e.target.value)} maxLength={10000} rows={3} required placeholder="Reply to the customer…"/><button className="primary" disabled={busy}><MessageSquareText size={15}/>{busy?"Sending…":"Send reply"}</button></form></section></div>}
+    {supportThread && <div className="modal-backdrop" onClick={() => setSupportThread(null)}><section className="support-admin-modal" onClick={e => e.stopPropagation()}><header><div><p className="eyebrow">SUPPORT TICKET · {supportThread.id.slice(0,8).toUpperCase()}</p><h2>{supportThread.subject}</h2><p className="subtle">{supportThread.user_name} · {supportThread.user_email}</p></div><button className="icon-button" onClick={() => setSupportThread(null)}><X size={18}/></button></header><div className="support-admin-controls"><label>Status<select disabled={busy} value={supportThread.status} onChange={e=>void changeSupportStatus(e.target.value)}><option value="open">Open</option><option value="in_progress">In progress</option><option value="waiting_on_user">Waiting on user</option><option value="resolved">Resolved</option><option value="closed">Closed</option></select></label><span>Updated {date(supportThread.updated_at)}</span></div><div className="support-admin-messages">{supportThread.messages.map((m:any)=><article key={m.id} className={`admin-ticket-message ${m.author_role}`}><small>{m.author_name} · {date(m.created_at)}</small><SupportMessageView text={m.body}/></article>)}</div><form className="support-admin-reply" onSubmit={sendSupportReply}><SupportEditor value={supportReply} onChange={setSupportReply} maxLength={10000} rows={3} placeholder="Reply to the customer…"/><button className="primary" disabled={busy}><MessageSquareText size={15}/>{busy?"Sending…":"Send reply"}</button></form></section></div>}
   </div>;
 }
 

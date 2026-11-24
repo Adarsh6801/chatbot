@@ -3,6 +3,7 @@ import { Activity, ArrowRight, BookOpen, Bot, Flame, MessageSquareText, ShieldCh
 import AntigravityLayer from "@/components/AntigravityLayer";
 import MarketingActions from "@/components/MarketingActions";
 import LandingHero from "@/components/LandingHero";
+import { SiteLogo, SiteName } from "@/components/SiteBranding";
 import "./landing.css";
 import "./marketing-nav.css";
 import "./antigravity.css";
@@ -21,7 +22,7 @@ const features = [
 export default function LandingPage() {
   return <AntigravityLayer><main className="marketing">
     <header className="marketing-nav">
-      <Link href="/" className="marketing-logo"><span className="marketing-logo-mark"><Flame size={19}/></span>AgentForge<span className="marketing-logo-period">.</span></Link>
+      <Link href="/" className="marketing-logo"><SiteLogo className="marketing-logo-img" fallback={<span className="marketing-logo-mark"><Flame size={19}/></span>} alt=""/><SiteName period/></Link>
       <nav className="marketing-links" aria-label="Main navigation"><a href="#features">Features</a><Link href="/plans">Plans</Link><Link href="/about">About</Link></nav>
       <MarketingActions />
     </header>
@@ -33,6 +34,6 @@ export default function LandingPage() {
     <section className="marketing-section"><div className="marketing-inner"><div className="marketing-section-heading"><span className="marketing-kicker">A SIMPLE PATH TO LAUNCH</span><h2>From your documents to a live assistant</h2><p>Build a grounded agent in a few clear steps. Start simple and add workflow logic when you need it.</p></div><div className="marketing-steps"><article className="marketing-step"><span>01 / ADD SOURCES</span><h3>Bring your knowledge</h3><p>Upload support guides, policies, product documentation, or other text-based sources.</p></article><article className="marketing-step"><span>02 / SHAPE ANSWERS</span><h3>Test and guide behavior</h3><p>Use the playground and visual workflow to tune routing, messages, and actions.</p></article><article className="marketing-step"><span>03 / GO LIVE</span><h3>Publish and learn</h3><p>Embed the agent, review conversations, and refine your knowledge from real questions.</p></article></div></div></section>
 
     <section className="marketing-cta"><div><span className="marketing-kicker">YOUR KNOWLEDGE, READY TO HELP</span><h2>Make every answer useful and easy to trust.</h2><p>Create an agent, add a source, and try a grounded answer.</p></div><Link className="marketing-btn primary" data-magnetic href="/agents">Open your workspace <ArrowRight size={15}/></Link></section>
-    <footer className="marketing-footer"><div className="marketing-footer-inner"><span>© {new Date().getFullYear()} AgentForge</span><div className="marketing-footer-links"><Link href="/about">About</Link><Link href="/plans">Plans</Link><Link href="/agents">Workspace</Link></div></div></footer>
+    <footer className="marketing-footer"><div className="marketing-footer-inner"><span>© {new Date().getFullYear()} <SiteName/></span><div className="marketing-footer-links"><Link href="/about">About</Link><Link href="/plans">Plans</Link><Link href="/agents">Workspace</Link></div></div></footer>
   </main></AntigravityLayer>;
 }

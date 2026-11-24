@@ -12,15 +12,15 @@ from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, Request, R
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 from .config import WEB_ORIGIN, PUBLIC_WEB_URL, PRODUCTION, PLANS
-from .database import Base, engine, Session, get_db, User, LoginSession, Bot, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, WorkflowApiLog, BotActivityLog, now
+from .database import Base, engine, Session, get_db, User, LoginSession, Bot, AgentVersion, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, WorkflowApiLog, BotActivityLog, AppSetting, now
 from .security import current_user, owned_bot, password_hash, verify_password, digest, rate_limit
 from .ingestion import ingest, parse_file, eval_bot, MAX_BYTES
 from .rag import retrieve, rerank, generate, generate_stream, INJECTION
-from .providers import hybrid_search, export_trace, store_raw
+from .providers import hybrid_search, export_trace, store_raw, store_widget_logo, read_widget_logo, read_site_logo
 from .workers import dispatch
 from sqlalchemy import text, update
 
@@ -127,8 +127,11 @@ class BotUpdate(BaseModel):
         if value.get('position', 'right') not in ('left', 'right'): raise ValueError('Position must be left or right.')
         greeting = str(value.get('greeting', 'Hi! How can I help?'))[:500]
         logo = str(value.get('logo', ''))[:2000]
-        if logo and not logo.startswith('https://'): raise ValueError('Logo must use HTTPS.')
-        return {'color': color, 'position': value.get('position', 'right'), 'greeting': greeting, 'logo': logo}
+        bucket = os.getenv('S3_BUCKET')
+        if logo and not logo.startswith('https://') and not (bucket and logo.startswith(f's3://{bucket}/agent-assets/')): raise ValueError('Logo must use HTTPS or be uploaded to this workspace S3 bucket.')
+        launcher_icon = value.get('launcher_icon', 'sparkle')
+        if launcher_icon not in ('sparkle', 'message', 'chat', 'headset'): raise ValueError('Choose a supported chat launcher icon.')
+        return {'color': color, 'position': value.get('position', 'right'), 'greeting': greeting, 'logo': logo, 'launcher_icon': launcher_icon}
 
 class SourceInput(BaseModel):
     name: str = Field(default='Knowledge note', min_length=1, max_length=200)
@@ -138,6 +141,8 @@ class SourceInput(BaseModel):
 class ChatInput(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     visitor_id: str = Field(min_length=8, max_length=100)
+    user_id: str | None = Field(default=None, min_length=1, max_length=200)
+    user_name: str | None = Field(default=None, min_length=1, max_length=80)
     conversation_id: str | None = Field(default=None, max_length=50)
     @field_validator('message')
     @classmethod
@@ -170,8 +175,23 @@ class ProfileInput(BaseModel):
 def user_data(user):
     return {'id': user.id, 'email': user.email, 'name': user.name, 'plan': user.plan,'avatar_url':user.avatar_url or '', 'company':user.company or '', 'bio':user.bio or '', 'google_connected':bool(user.google_sub),'created_at':user.created_at,'is_active':bool(user.is_active),'is_admin':bool(os.getenv('ADMIN_USER_ID', '').strip() and user.id == os.getenv('ADMIN_USER_ID', '').strip()),'billing_provider':user.billing_provider}
 
+def has_active_subscription(user):
+    return bool(user and user.plan != 'free' and ((user.billing_provider == 'stripe' and user.stripe_customer_id and user.subscription_id) or (user.billing_provider == 'razorpay' and user.razorpay_subscription_id)))
+
+def bot_snapshot(bot):
+    widget = dict(bot.widget_config or {})
+    for key, value in {'color':'#d6ff63','position':'right','greeting':'Hi! What can I help you find?','logo':'','launcher_icon':'sparkle'}.items(): widget.setdefault(key,value)
+    return {'name': bot.name, 'description': bot.description or '', 'system_prompt': bot.system_prompt or '', 'threshold': bot.threshold, 'widget_config': widget}
+
 def bot_data(bot, db):
-    return {key: getattr(bot, key) for key in ('id', 'name', 'description', 'slug', 'public_key', 'system_prompt', 'widget_config', 'threshold', 'created_at')} | {'published':bool(bot.published),'documents': db.query(Document).filter_by(bot_id=bot.id).count(), 'messages': db.query(Message).filter_by(bot_id=bot.id, role='assistant').count()}
+    snapshot = bot_snapshot(bot)
+    latest = db.query(AgentVersion).filter_by(bot_id=bot.id).order_by(AgentVersion.major.desc(), AgentVersion.minor.desc(), AgentVersion.created_at.desc()).first()
+    baseline = bot.published_config or snapshot
+    draft_changed = snapshot != baseline
+    draft_needs_save = draft_changed and (not latest or latest.snapshot != snapshot)
+    owner = db.get(User, bot.user_id)
+    major = db.query(AgentVersion).filter_by(bot_id=bot.id,kind='major').order_by(AgentVersion.major.desc()).first()
+    return {key: getattr(bot, key) for key in ('id', 'name', 'description', 'slug', 'public_key', 'system_prompt', 'widget_config', 'threshold', 'created_at')} | {'published':bool(bot.published),'draft_changed':draft_changed,'draft_needs_save':draft_needs_save,'version_history_enabled':has_active_subscription(owner),'published_version':f'{major.major}.0' if major else None,'documents': db.query(Document).filter_by(bot_id=bot.id).count(), 'messages': db.query(Message).filter_by(bot_id=bot.id, role='assistant').count()}
 
 def doc_data(doc):
     return {key: getattr(doc, key) for key in ('id', 'name', 'source_type', 'source_uri', 'status', 'error', 'chunk_count', 'created_at')}
@@ -249,6 +269,8 @@ def create_bot(body: BotInput, db: DBSession = Depends(get_db), user=Depends(cur
     slug = (re.sub(r'[^a-z0-9]+', '-', body.name.lower()).strip('-') or 'agent') + '-' + secrets.token_hex(3)
     bot = Bot(user_id=user.id, name=body.name.strip(), description=body.description, slug=slug)
     db.add(bot)
+    db.flush()
+    bot.published_config = bot_snapshot(bot)
     db.commit()
     record_bot_log(db,bot.id,'dashboard',None,{'event_type':'agent_created','severity':'info','title':'Agent created','details':{'name':bot.name}})
     return bot_data(bot, db)
@@ -268,16 +290,80 @@ def get_bot(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_u
 def update_bot(bot_id: str, body: BotUpdate, db: DBSession = Depends(get_db), user=Depends(current_user)):
     bot = owned_bot(db, bot_id, user)
     updates=body.model_dump(exclude_unset=True)
+    publish_requested = updates.pop('published', None)
+    requested_logo = (updates.get('widget_config') or {}).get('logo', '')
+    if requested_logo.startswith('s3://') and not requested_logo.startswith(f"s3://{os.getenv('S3_BUCKET', '')}/agent-assets/{bot.id}/logos/"):
+        raise HTTPException(422, 'Uploaded logo must belong to this agent.')
     for key, value in updates.items():
         if value is not None: setattr(bot, key, value)
+    if publish_requested is True:
+        publish_agent_snapshot(db, bot, user.id)
+    elif publish_requested is False:
+        bot.published = 0
     db.commit()
     if updates: record_bot_log(db,bot_id,'dashboard',None,{'event_type':'agent_settings','severity':'info','title':'Agent settings updated','details':{'fields':sorted(updates.keys())}})
     return bot_data(bot, db)
 
+def publish_agent_snapshot(db, bot, user_id):
+    snapshot = bot_snapshot(bot)
+    has_major = db.query(AgentVersion).filter_by(bot_id=bot.id, kind='major').count() > 0
+    if not has_major or bot.published_config != snapshot:
+        latest_major = db.query(func.max(AgentVersion.major)).filter_by(bot_id=bot.id, kind='major').scalar() or 0
+        db.add(AgentVersion(bot_id=bot.id, created_by=user_id, major=latest_major + 1, minor=0, kind='major', snapshot=snapshot))
+        bot.published_config = snapshot
+    bot.published = 1
+
+def require_version_history(user):
+    if not has_active_subscription(user):
+        raise HTTPException(403, 'Agent version history is available to subscribed users.')
+
+def agent_version_data(version):
+    return {'id':version.id,'version':f'{version.major}.{version.minor}','major':version.major,'minor':version.minor,'kind':version.kind,'created_at':version.created_at,'snapshot':version.snapshot}
+
+@app.post('/api/v1/bots/{bot_id}/versions/draft')
+def save_agent_draft_version(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
+    bot = owned_bot(db, bot_id, user)
+    require_version_history(user)
+    snapshot = bot_snapshot(bot)
+    if snapshot == (bot.published_config or snapshot): return {'created':False,'reason':'no_changes'}
+    latest = db.query(AgentVersion).filter_by(bot_id=bot.id).order_by(AgentVersion.major.desc(),AgentVersion.minor.desc(),AgentVersion.created_at.desc()).first()
+    if latest and latest.snapshot == snapshot: return {'created':False,'reason':'already_saved','version':f'{latest.major}.{latest.minor}'}
+    latest_major = db.query(func.max(AgentVersion.major)).filter_by(bot_id=bot.id,kind='major').scalar() or 0
+    latest_minor = db.query(func.max(AgentVersion.minor)).filter_by(bot_id=bot.id,major=latest_major).scalar() or 0
+    version = AgentVersion(bot_id=bot.id,created_by=user.id,major=latest_major,minor=latest_minor+1,kind='minor',snapshot=snapshot)
+    db.add(version);db.commit()
+    record_bot_log(db,bot.id,'dashboard',None,{'event_type':'agent_version','severity':'info','title':'Agent draft version saved','details':{'version':f'{version.major}.{version.minor}'}})
+    return {'created':True,'version':f'{version.major}.{version.minor}'}
+
+@app.get('/api/v1/bots/{bot_id}/versions')
+def list_agent_versions(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
+    owned_bot(db, bot_id, user)
+    require_version_history(user)
+    versions = db.query(AgentVersion).filter_by(bot_id=bot_id).order_by(AgentVersion.major.desc(),AgentVersion.minor.desc(),AgentVersion.created_at.desc()).all()
+    return {'items':[agent_version_data(version) for version in versions]}
+
+@app.post('/api/v1/bots/{bot_id}/versions/{version_id}/restore')
+def restore_agent_version(bot_id: str, version_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
+    bot = owned_bot(db, bot_id, user)
+    require_version_history(user)
+    version = db.query(AgentVersion).filter_by(id=version_id,bot_id=bot_id,kind='major').first()
+    if not version: raise HTTPException(404,'Published version not found.')
+    snapshot = version.snapshot
+    if bot_snapshot(bot) == snapshot and bot.published_config == snapshot:
+        bot.published = 1;db.commit();return {'restored':False,'version':f'{version.major}.{version.minor}'}
+    for field in ('name','description','system_prompt','threshold','widget_config'): setattr(bot,field,snapshot[field])
+    bot.published_config = dict(snapshot)
+    bot.published = 1
+    next_major = (db.query(func.max(AgentVersion.major)).filter_by(bot_id=bot.id,kind='major').scalar() or 0) + 1
+    restored = AgentVersion(bot_id=bot.id,created_by=user.id,major=next_major,minor=0,kind='major',snapshot=dict(snapshot))
+    db.add(restored);db.commit()
+    record_bot_log(db,bot.id,'dashboard',None,{'event_type':'agent_version','severity':'warning','title':'Agent restored to a published version','details':{'restored_version':f'{version.major}.{version.minor}','new_version':f'{restored.major}.0'}})
+    return {'restored':True,'version':f'{restored.major}.0'}
+
 @app.delete('/api/v1/bots/{bot_id}')
 def delete_bot(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
     bot = owned_bot(db, bot_id, user)
-    for model in (Message, Flag, EvalRun, Chunk, Document, WorkflowApiLog, BotActivityLog, Conversation, Workflow): db.query(model).filter_by(bot_id=bot.id).delete()
+    for model in (Message, Flag, EvalRun, Chunk, Document, WorkflowApiLog, BotActivityLog, Conversation, AgentVersion, Workflow): db.query(model).filter_by(bot_id=bot.id).delete()
     db.delete(bot)
     db.commit()
     return {'ok': True}
@@ -326,6 +412,33 @@ async def upload_document(bot_id: str, tasks: BackgroundTasks, file: UploadFile 
     record_bot_log(db,bot_id,'dashboard',None,{'event_type':'knowledge_source','severity':'info','title':'Knowledge file uploaded','details':{'document_id':doc.id,'name':name,'bytes':len(raw),'status':doc.status}})
     return doc_data(doc)
 
+LOGO_TYPES = {
+    '.png': ('image/png', lambda raw: raw.startswith(b'\x89PNG\r\n\x1a\n')),
+    '.jpg': ('image/jpeg', lambda raw: raw.startswith(b'\xff\xd8\xff')),
+    '.jpeg': ('image/jpeg', lambda raw: raw.startswith(b'\xff\xd8\xff')),
+    '.webp': ('image/webp', lambda raw: len(raw) >= 12 and raw[:4] == b'RIFF' and raw[8:12] == b'WEBP'),
+    '.gif': ('image/gif', lambda raw: raw.startswith((b'GIF87a', b'GIF89a'))),
+}
+
+@app.post('/api/v1/bots/{bot_id}/widget/logo')
+async def upload_widget_logo(bot_id: str, request: Request, file: UploadFile = File(...), db: DBSession = Depends(get_db), user=Depends(current_user)):
+    bot = owned_bot(db, bot_id, user)
+    if not os.getenv('S3_BUCKET'): raise HTTPException(503, 'Configure S3_BUCKET to upload agent logos.')
+    raw = await file.read(5 * 1024 * 1024 + 1)
+    extension = Path(file.filename or '').suffix.lower()
+    kind = LOGO_TYPES.get(extension)
+    if len(raw) > 5 * 1024 * 1024 or not kind or not kind[1](raw):
+        raise HTTPException(422, 'Choose a PNG, JPG, WEBP, or GIF image under 5 MB.')
+    try:
+        logo_ref = await asyncio.to_thread(store_widget_logo, bot.id, extension.lstrip('.'), raw, kind[0])
+    except Exception:
+        logging.getLogger('agentforge').exception('Agent logo upload failed for %s', bot.id)
+        raise HTTPException(502, 'Logo upload failed. Check the S3 connection and try again.')
+    bot.widget_config = dict(bot.widget_config or {}) | {'logo': logo_ref}
+    db.commit()
+    logo_url = str(request.base_url).rstrip('/') + f'/api/v1/bots/{bot.id}/widget/logo'
+    return {'logo': logo_ref, 'logo_url': logo_url}
+
 @app.delete('/api/v1/bots/{bot_id}/documents/{doc_id}')
 def delete_document(bot_id: str, doc_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
     owned_bot(db, bot_id, user)
@@ -352,16 +465,88 @@ def retrain(bot_id: str, tasks: BackgroundTasks, db: DBSession = Depends(get_db)
     return {'queued': len(docs)}
 
 @app.get('/api/v1/public/bots/{slug}')
-def public_bot(slug: str, db: DBSession = Depends(get_db)):
+def public_bot(slug: str, request: Request, db: DBSession = Depends(get_db)):
     bot = db.query(Bot).filter_by(slug=slug, published=1).first()
     if not bot: raise HTTPException(404, 'This agent is not published.')
-    return {key: getattr(bot, key) for key in ('name', 'description', 'public_key', 'widget_config')}
+    runtime = public_agent_config(bot)
+    return {'name':runtime['name'],'description':runtime['description'],'public_key':bot.public_key,'widget_config':public_widget_config(bot, request)}
 
 @app.get('/api/v1/public/widget/{key}')
-def widget_config(key: str, db: DBSession = Depends(get_db)):
+def widget_config(key: str, request: Request, db: DBSession = Depends(get_db)):
     bot = db.query(Bot).filter_by(public_key=key, published=1).first()
     if not bot: raise HTTPException(404, 'This agent is not published.')
-    return {'name': bot.name, 'chat_url': PUBLIC_WEB_URL + '/chat/' + bot.slug, 'widget_config': bot.widget_config}
+    return {'name': public_agent_config(bot)['name'], 'chat_url': PUBLIC_WEB_URL + '/chat/' + bot.slug, 'widget_config': public_widget_config(bot, request)}
+
+@app.get('/api/v1/public/site-settings')
+def public_site_settings(request: Request, db: DBSession = Depends(get_db)):
+    setting = db.get(AppSetting,'site_branding')
+    try: branding = json.loads(setting.value) if setting else {}
+    except (TypeError,json.JSONDecodeError): branding = {}
+    logo = str(branding.get('logo') or '')
+    return {'name':str(branding.get('name') or 'AgentForge'),'logo_url':str(request.base_url).rstrip('/')+'/api/v1/public/site-logo' if logo else ''}
+
+@app.get('/api/v1/public/site-logo')
+def public_site_logo(db: DBSession = Depends(get_db)):
+    setting = db.get(AppSetting,'site_branding')
+    try: branding = json.loads(setting.value) if setting else {}
+    except (TypeError,json.JSONDecodeError): branding = {}
+    logo = str(branding.get('logo') or '')
+    if not logo: raise HTTPException(404,'Site logo not found.')
+    try: content, content_type = read_site_logo(logo)
+    except Exception:
+        logging.getLogger('agentforge').exception('Site logo could not be loaded')
+        raise HTTPException(502,'Site logo storage is unavailable.')
+    if content_type != 'image/png': raise HTTPException(404,'Site logo not found.')
+    return Response(content,media_type='image/png',headers={'Cache-Control':'public, max-age=3600','X-Content-Type-Options':'nosniff'})
+
+def public_widget_config(bot, request):
+    config = dict(public_agent_config(bot).get('widget_config') or {})
+    if str(config.get('logo', '')).startswith('s3://'):
+        config['logo'] = str(request.base_url).rstrip('/') + f'/api/v1/public/bots/{bot.public_key}/logo'
+    return config
+
+def public_agent_config(bot):
+    return bot.published_config if bot.published and bot.published_config else bot_snapshot(bot)
+
+@app.get('/api/v1/public/bots/{key}/logo')
+def public_agent_logo(key: str, db: DBSession = Depends(get_db)):
+    bot = db.query(Bot).filter_by(public_key=key, published=1).first()
+    if not bot: raise HTTPException(404, 'Agent not found.')
+    return agent_logo_response(bot, published=True)
+
+@app.get('/api/v1/bots/{bot_id}/widget/logo')
+def owner_agent_logo(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
+    return agent_logo_response(owned_bot(db, bot_id, user))
+
+def agent_logo_response(bot, published=False):
+    source = public_agent_config(bot) if published else bot_snapshot(bot)
+    logo = str((source.get('widget_config') or {}).get('logo', ''))
+    expected_prefix = f"s3://{os.getenv('S3_BUCKET', '')}/agent-assets/{bot.id}/logos/"
+    if not os.getenv('S3_BUCKET') or not logo.startswith(expected_prefix): raise HTTPException(404, 'Logo not found.')
+    try:
+        content, content_type = read_widget_logo(logo)
+    except Exception:
+        logging.getLogger('agentforge').exception('Agent logo could not be loaded for %s', bot.id)
+        raise HTTPException(502, 'Logo storage is unavailable.')
+    if content_type not in {kind[0] for kind in LOGO_TYPES.values()}: raise HTTPException(404, 'Logo not found.')
+    return Response(content, media_type=content_type, headers={'Cache-Control': ('public' if published else 'private') + ', max-age=3600', 'X-Content-Type-Options': 'nosniff'})
+
+@app.get('/api/v1/public/chat/{key}/history')
+def public_chat_history(key: str, visitor_id: str, db: DBSession = Depends(get_db)):
+    bot = db.query(Bot).filter_by(public_key=key, published=1).first()
+    if not bot: raise HTTPException(404, 'Agent not found.')
+    query = db.query(Conversation).filter_by(bot_id=bot.id, visitor_id=visitor_id)
+    conversations = query.all()
+    latest = None
+    latest_activity = ''
+    for candidate in conversations:
+        last = db.query(Message).filter_by(conversation_id=candidate.id).order_by(Message.created_at.desc()).first()
+        activity = last.created_at if last else candidate.created_at
+        if activity >= latest_activity:
+            latest, latest_activity = candidate, activity
+    if not latest: return {'conversation_id': None, 'messages': []}
+    messages = db.query(Message).filter_by(conversation_id=latest.id).order_by(Message.created_at.asc()).all()
+    return {'conversation_id': latest.id, 'messages': [{'id': m.id, 'role': m.role, 'content': m.content, 'citations': m.citations, 'confidence': m.confidence, 'created_at': m.created_at} for m in messages]}
 
 @app.options('/api/v1/chat/{key}')
 def chat_options(key: str):
@@ -369,10 +554,12 @@ def chat_options(key: str):
 
 AGENT_IDENTITY_QUESTION = re.compile(r"\b(?:who\s+are\s+you|what\s+is\s+your\s+name|what's\s+your\s+name|what\s+are\s+you|introduce\s+yourself|tell\s+me\s+about\s+yourself|what\s+do\s+you\s+do|what\s+can\s+you\s+(?:do|help\s+with))\b", re.I)
 
-def agent_identity_answer(bot, message):
+def agent_identity_answer(bot, message, runtime=None):
     if not AGENT_IDENTITY_QUESTION.search(message): return None
-    name = (bot.name or 'this assistant').strip()
-    description = (bot.description or '').strip()
+    name = ((runtime or {}).get('name') if runtime and 'name' in runtime else bot.name) or 'this assistant'
+    description = (runtime.get('description', bot.description) if runtime else bot.description) or ''
+    name = name.strip()
+    description = description.strip()
     if description:
         return f"I'm {name}, an AI assistant. {description}"
     return f"I'm {name}, an AI assistant. I answer questions using the knowledge sources connected to this agent."
@@ -381,9 +568,17 @@ def agent_identity_answer(bot, message):
 async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depends(get_db)):
     bot = db.query(Bot).filter_by(public_key=key).first()
     if not bot: raise HTTPException(404, 'Agent not found.')
+    runtime = public_agent_config(bot)
     if not bot.published:
         user = current_user(request, db)
         if user.id != bot.user_id: raise HTTPException(404, 'Agent not found.')
+        runtime = bot_snapshot(bot)
+    elif request.cookies.get('agentforge_session'):
+        try:
+            owner = current_user(request, db)
+            if owner.id == bot.user_id: runtime = bot_snapshot(bot)
+        except HTTPException:
+            pass
     rate_limit(db, f'chat:{key}:{request.client.host if request.client else "unknown"}', 30)
     user = db.get(User, bot.user_id)
     month = datetime.now(timezone.utc).strftime('%Y-%m')
@@ -393,19 +588,23 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
     if count >= PLANS[user.plan]['messages']: raise HTTPException(429, 'This agent has reached its monthly message limit.')
     conversation = None
     if body.conversation_id:
-        conversation = db.query(Conversation).filter_by(id=body.conversation_id, bot_id=bot.id, visitor_id=body.visitor_id).first()
+        identity_match = or_(Conversation.visitor_id == body.visitor_id, Conversation.user_id == body.user_id) if body.user_id else Conversation.visitor_id == body.visitor_id
+        conversation = db.query(Conversation).filter(Conversation.id == body.conversation_id, Conversation.bot_id == bot.id, identity_match).first()
         if not conversation: raise HTTPException(404, 'Conversation not found.')
     if not conversation:
-        conversation = Conversation(bot_id=bot.id, visitor_id=body.visitor_id)
+        conversation = Conversation(bot_id=bot.id, visitor_id=body.visitor_id, user_id=body.user_id, user_name=body.user_name)
         db.add(conversation)
         db.flush()
+    elif body.user_id or body.user_name:
+        conversation.user_id = body.user_id or conversation.user_id
+        conversation.user_name = body.user_name or conversation.user_name
     history = db.query(Message).filter_by(conversation_id=conversation.id).order_by(Message.created_at.desc()).limit(40).all()[::-1]
     db.add(Message(conversation_id=conversation.id, bot_id=bot.id, role='user', content=body.message))
     db.commit()
     record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'message_received','severity':'info','title':'Visitor message received','details':{'message_length':len(body.message),'workflow_enabled':bool(db.query(Workflow).filter_by(bot_id=bot.id,enabled=1).first())}})
     start = time.perf_counter()
     blocked = bool(INJECTION.search(body.message))
-    identity_answer = None if blocked else agent_identity_answer(bot, body.message)
+    identity_answer = None if blocked else agent_identity_answer(bot, body.message, runtime)
     workflow_result=None
     workflow=db.query(Workflow).filter_by(bot_id=bot.id,enabled=1).first()
     if workflow and workflow.published_graph and not blocked and not identity_answer:
@@ -421,9 +620,9 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
         raise HTTPException(502, 'Retrieval provider is unavailable. Please try again.')
     try: hits = await rerank(body.message, hits)
     except httpx.HTTPError: hits = hits[:8]
-    hits = [h for h in hits if h['confidence'] >= min(0.12, bot.threshold)]
+    hits = [h for h in hits if h['confidence'] >= min(0.12, runtime['threshold'])]
     confidence = 1.0 if identity_answer else max((h['confidence'] for h in hits), default=0)
-    abstain = blocked or (not identity_answer and confidence < bot.threshold)
+    abstain = blocked or (not identity_answer and confidence < runtime['threshold'])
     citations = [{'id': h['chunk'].id, 'index': i+1, 'document_id': h['chunk'].document_id, 'source': db.get(Document, h['chunk'].document_id).name, 'excerpt': h['chunk'].content[:500]} for i, h in enumerate(hits)] if not abstain else []
     if workflow_result:
         confidence=workflow_result['confidence'];citations=workflow_result['citations'];abstain=workflow_result['abstained']
@@ -431,7 +630,7 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
         record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'knowledge_search','severity':'warning' if abstain else 'info','title':'Knowledge search completed','details':{'result_count':len(hits),'confidence':round(confidence,4),'citation_count':len(citations),'abstained':abstain,'identity_response':bool(identity_answer)}})
     else:
         record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'error','severity':'warning','title':'Message blocked by safety rules','details':{'reason':'prompt_injection'}})
-    conv_id, bot_id, system_prompt = conversation.id, bot.id, bot.system_prompt
+    conv_id, bot_id, system_prompt = conversation.id, bot.id, runtime['system_prompt']
     db.close()
     async def stream():
         def event(kind, data): return f'event: {kind}\ndata: {json.dumps(data)}\n\n'
@@ -491,7 +690,35 @@ def conversations(bot_id: str, page: int = 1, db: DBSession = Depends(get_db), u
     owned_bot(db, bot_id, user)
     query = db.query(Conversation).filter_by(bot_id=bot_id)
     items = query.order_by(Conversation.created_at.desc()).offset((max(page, 1)-1)*20).limit(20).all()
-    return {'total': query.count(), 'items': [{'id': c.id, 'visitor_id': c.visitor_id, 'created_at': c.created_at, 'messages': [{key: getattr(m, key) for key in ('id', 'role', 'content', 'citations', 'trace', 'confidence', 'tokens', 'cost_cents', 'latency_ms', 'created_at')} for m in db.query(Message).filter_by(conversation_id=c.id).order_by(Message.created_at).all()]} for c in items]}
+    return {'total': query.count(), 'items': [{'id': c.id, 'visitor_id': c.visitor_id, 'user_id': c.user_id, 'user_name': c.user_name, 'created_at': c.created_at, 'messages': [{key: getattr(m, key) for key in ('id', 'role', 'content', 'citations', 'trace', 'confidence', 'tokens', 'cost_cents', 'latency_ms', 'created_at')} for m in db.query(Message).filter_by(conversation_id=c.id).order_by(Message.created_at).all()]} for c in items]}
+
+@app.get('/api/v1/bots/{bot_id}/visitors')
+def visitors(bot_id: str, page: int = 1, db: DBSession = Depends(get_db), user=Depends(current_user)):
+    owned_bot(db, bot_id, user)
+    rows = db.query(Conversation).filter_by(bot_id=bot_id).order_by(Conversation.created_at.desc()).all()
+    groups = {}
+    for conversation in rows:
+        key = 'user:' + conversation.user_id if conversation.user_id else 'visitor:' + conversation.visitor_id
+        last_activity = db.query(Message).filter_by(conversation_id=conversation.id).order_by(Message.created_at.desc()).first()
+        group = groups.setdefault(key, {'key': key, 'user_id': conversation.user_id, 'user_name': conversation.user_name, 'visitor_id': conversation.visitor_id, 'conversation_count': 0, 'last_seen': last_activity.created_at if last_activity else conversation.created_at, 'last_message': ''})
+        group['conversation_count'] += 1
+        if conversation.user_name and not group['user_name']: group['user_name'] = conversation.user_name
+        if last_activity and last_activity.created_at >= group['last_seen']:
+            group['last_seen'] = last_activity.created_at
+            message = db.query(Message).filter_by(conversation_id=conversation.id, role='user').order_by(Message.created_at.desc()).first()
+            if message: group['last_message'] = message.content
+    all_groups = sorted(groups.values(), key=lambda item: item['last_seen'], reverse=True)
+    start = (max(page, 1)-1)*20
+    return {'total': len(all_groups), 'items': all_groups[start:start+20]}
+
+@app.get('/api/v1/bots/{bot_id}/visitor-conversations')
+def visitor_conversations(bot_id: str, visitor_key: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
+    owned_bot(db, bot_id, user)
+    kind, sep, identity = visitor_key.partition(':')
+    if not sep or kind not in ('user', 'visitor') or not identity: raise HTTPException(400, 'Invalid visitor key.')
+    query = db.query(Conversation).filter_by(bot_id=bot_id, user_id=identity) if kind == 'user' else db.query(Conversation).filter_by(bot_id=bot_id, visitor_id=identity, user_id=None)
+    items = query.order_by(Conversation.created_at.desc()).all()
+    return {'items': [{'id': c.id, 'user_id': c.user_id, 'user_name': c.user_name, 'visitor_id': c.visitor_id, 'created_at': c.created_at, 'messages': [{key: getattr(m, key) for key in ('id', 'role', 'content', 'citations', 'trace', 'confidence', 'tokens', 'cost_cents', 'latency_ms', 'created_at')} for m in db.query(Message).filter_by(conversation_id=c.id).order_by(Message.created_at).all()]} for c in items]}
 
 @app.get('/api/v1/bots/{bot_id}/analytics/summary')
 def analytics(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):

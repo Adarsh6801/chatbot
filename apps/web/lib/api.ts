@@ -7,11 +7,11 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `Request failed (${response.status}). Check your input.`);
   return data;
 }
-export type Bot = {id:string; name:string; description:string; slug:string; public_key:string; system_prompt:string; threshold:number; published:boolean; documents:number; messages:number; widget_config:{color:string; greeting:string; position:string; logo:string}};
+export type Bot = {id:string; name:string; description:string; slug:string; public_key:string; system_prompt:string; threshold:number; published:boolean; draft_changed?:boolean; draft_needs_save?:boolean; version_history_enabled?:boolean; published_version?:string|null; documents:number; messages:number; widget_config:{color:string; greeting:string; position:string; logo:string; launcher_icon?:string}};
 export type Citation = {index:number; source:string; excerpt:string};
 export type ChatMessage = {role:'user'|'assistant'; content:string; citations?:Citation[]; confidence?:number; model?:string};
-export async function streamChat(key:string, message:string, visitor:string, conversation:string|null, onEvent:(event:string,data:any)=>void, publicView=false) {
-  const response = await fetch(`${API}/api/v1/chat/${key}`, {method:'POST', credentials:publicView?'omit':'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message, visitor_id:visitor, conversation_id:conversation})});
+export async function streamChat(key:string, message:string, visitor:string, conversation:string|null, onEvent:(event:string,data:any)=>void, publicView=false, userId?:string, userName?:string) {
+  const response = await fetch(`${API}/api/v1/chat/${key}`, {method:'POST', credentials:publicView?'omit':'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message, visitor_id:visitor, conversation_id:conversation, user_id:userId || undefined, user_name:userName || undefined})});
   if (!response.ok) {const data = await response.json(); throw new Error(data.detail || 'Chat request failed.');}
   if (!response.body) throw new Error('Streaming is not supported in this browser.');
   const reader = response.body.getReader(), decoder = new TextDecoder();
