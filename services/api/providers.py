@@ -70,7 +70,8 @@ def store_raw(document_id, name, raw):
     if not bucket: return ''
     import boto3
     client = boto3.client('s3', endpoint_url=os.getenv('S3_ENDPOINT_URL') or None)
-    key = 'documents/' + document_id + '/' + name
+    prefix = os.getenv('S3_KEY_PREFIX', 'documents').strip('/')
+    key = '/'.join(part for part in (prefix, document_id, name) if part)
     extra = {} if os.getenv('S3_ENDPOINT_URL') else {'ServerSideEncryption':'AES256'}
     client.put_object(Bucket=bucket, Key=key, Body=raw, ContentType='application/octet-stream', **extra)
     return 's3://' + bucket + '/' + key

@@ -34,7 +34,9 @@ def migrate():
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (2) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (3) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (4) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (5) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (6) ON CONFLICT (version) DO NOTHING'))
 
 if __name__ == '__main__':
     migrate()
-    print('AgentForge schema version 4 applied.')
+    print('AgentForge schema version 6 applied.')

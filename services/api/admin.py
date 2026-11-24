@@ -2,12 +2,12 @@
 import os
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .config import PLANS
-from .database import AdminAudit, ApiKey, AppSetting, Bot, Conversation, Document, LoginSession, Message, User, get_db, now
+from .database import AdminAudit, ApiKey, AppSetting, Bot, Conversation, Document, LoginSession, Message, SupportTicket, SupportTicketMessage, User, get_db, now
 from .payment_settings import get_payment_provider, payment_provider_status
 from .security import current_user
 
@@ -36,6 +36,14 @@ class AgentUpdate(BaseModel):
 
 class PaymentProviderUpdate(BaseModel):
     provider: str
+
+
+class SupportReply(BaseModel):
+    message: str = Field(min_length=1, max_length=10000)
+
+
+class SupportStatusUpdate(BaseModel):
+    status: str
 
 
 @router.get("/overview")
@@ -208,3 +216,89 @@ def conversation(conversation_id: str, db: Session = Depends(get_db), _admin: Us
         "id": message.id, "role": message.role, "content": message.content,
         "citations": message.citations or [], "created_at": message.created_at,
     } for message in db.query(Message).filter_by(conversation_id=conversation_id).order_by(Message.created_at.asc()).all()]
+
+
+def support_ticket_item(db: Session, ticket: SupportTicket, owner: User) -> dict:
+    last = db.query(SupportTicketMessage).filter_by(ticket_id=ticket.id).order_by(SupportTicketMessage.created_at.desc()).first()
+    return {"id": ticket.id, "subject": ticket.subject, "status": ticket.status, "user_id": owner.id,
+            "user_name": owner.name, "user_email": owner.email, "created_at": ticket.created_at,
+            "updated_at": ticket.updated_at, "admin_unread": bool(ticket.admin_unread),
+            "last_message": last.body[:240] if last else "", "last_author_role": last.author_role if last else ""}
+
+
+@router.get("/support/tickets")
+def support_tickets(q: str = "", status: str = "all", page: int = 1, limit: int = 25,
+                    db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    page, limit = max(1, page), min(100, max(1, limit))
+    query = db.query(SupportTicket, User).join(User, SupportTicket.user_id == User.id)
+    if status not in ("all", "open", "waiting_on_user", "in_progress", "resolved", "closed"):
+        raise HTTPException(422, "Choose a valid support status.")
+    if status != "all":
+        query = query.filter(SupportTicket.status == status)
+    if q.strip():
+        needle = "%" + q.strip().replace("%", r"\%").replace("_", r"\_") + "%"
+        query = query.filter(SupportTicket.subject.ilike(needle) | User.name.ilike(needle) | User.email.ilike(needle))
+    total = query.count()
+    rows = query.order_by(SupportTicket.updated_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    unread = db.query(func.count(SupportTicket.id)).filter(SupportTicket.admin_unread == 1).scalar() or 0
+    return {"items": [support_ticket_item(db, ticket, owner) for ticket, owner in rows], "total": total,
+            "page": page, "limit": limit, "unread": unread}
+
+
+@router.get("/support/tickets/{ticket_id}")
+def support_ticket(ticket_id: str, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    ticket = db.get(SupportTicket, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Support ticket not found.")
+    owner = db.get(User, ticket.user_id)
+    messages = db.query(SupportTicketMessage).filter_by(ticket_id=ticket.id).order_by(SupportTicketMessage.created_at.asc()).all()
+    return {**support_ticket_item(db, ticket, owner), "messages": [{"id": m.id, "author_role": m.author_role,
+            "author_name": owner.name if m.author_role == "user" else "Support team", "body": m.body,
+            "created_at": m.created_at} for m in messages]}
+
+
+@router.post("/support/tickets/{ticket_id}/read")
+def mark_support_ticket_read(ticket_id: str, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    ticket = db.get(SupportTicket, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Support ticket not found.")
+    if ticket.admin_unread:
+        ticket.admin_unread = 0
+        db.commit()
+    return {"ok": True}
+
+
+@router.post("/support/tickets/{ticket_id}/messages", status_code=201)
+def reply_support_ticket(ticket_id: str, body: SupportReply, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    ticket = db.get(SupportTicket, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Support ticket not found.")
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(422, "Reply cannot be blank.")
+    db.add(SupportTicketMessage(ticket_id=ticket.id, author_id=admin.id, author_role="admin", body=message))
+    ticket.status = "waiting_on_user"
+    ticket.user_unread = 1
+    ticket.admin_unread = 0
+    ticket.updated_at = now()
+    write_audit(db, admin, "support_ticket.replied", "support_ticket", ticket.id, {"subject": ticket.subject})
+    db.commit()
+    return {"ok": True, "status": ticket.status}
+
+
+@router.patch("/support/tickets/{ticket_id}")
+def update_support_ticket(ticket_id: str, body: SupportStatusUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    if body.status not in ("open", "in_progress", "waiting_on_user", "resolved", "closed"):
+        raise HTTPException(422, "Choose a valid support status.")
+    ticket = db.get(SupportTicket, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Support ticket not found.")
+    previous = ticket.status
+    ticket.status = body.status
+    ticket.updated_at = now()
+    if previous != body.status:
+        ticket.user_unread = 1
+        write_audit(db, admin, "support_ticket.status_changed", "support_ticket", ticket.id,
+                    {"subject": ticket.subject, "from": previous, "to": body.status})
+    db.commit()
+    return {"ok": True, "status": ticket.status}

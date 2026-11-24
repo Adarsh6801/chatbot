@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import create_engine, Column, String, Text, Float, Integer, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, String, Text, Float, Integer, ForeignKey, JSON, Index
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.types import UserDefinedType
@@ -163,6 +163,27 @@ class AdminAudit(Base):
     details = Column(JSON, default=dict)
     created_at = Column(String, default=now, index=True)
 
+class SupportTicket(Base):
+    __tablename__ = 'support_tickets'
+    __table_args__ = (Index('ix_support_tickets_updated', 'updated_at'),)
+    id = Column(String, primary_key=True, default=uid)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    subject = Column(String, nullable=False)
+    status = Column(String, nullable=False, default='open', index=True)
+    admin_unread = Column(Integer, nullable=False, default=1)
+    user_unread = Column(Integer, nullable=False, default=0)
+    created_at = Column(String, default=now, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
+
+class SupportTicketMessage(Base):
+    __tablename__ = 'support_ticket_messages'
+    id = Column(String, primary_key=True, default=uid)
+    ticket_id = Column(String, ForeignKey('support_tickets.id'), nullable=False, index=True)
+    author_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    author_role = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    created_at = Column(String, default=now, nullable=False)
+
 class AppSetting(Base):
     __tablename__ = 'app_settings'
     key = Column(String, primary_key=True)
@@ -178,6 +199,37 @@ class Workflow(Base):
     enabled = Column(Integer, default=0)
     version = Column(Integer, default=0)
     updated_at = Column(String, default=now)
+
+class WorkflowApiLog(Base):
+    __tablename__ = 'workflow_api_logs'
+    __table_args__ = (Index('ix_workflow_api_logs_bot_created', 'bot_id', 'created_at'),)
+    id = Column(String, primary_key=True, default=uid)
+    bot_id = Column(String, ForeignKey('bots.id'), nullable=False)
+    conversation_id = Column(String, ForeignKey('conversations.id'), nullable=True, index=True)
+    source = Column(String, nullable=False, default='chat')
+    node_id = Column(String, nullable=False)
+    node_name = Column(String, nullable=False)
+    method = Column(String, nullable=False)
+    url = Column(Text, nullable=False)
+    status_code = Column(Integer, nullable=True)
+    success = Column(Integer, nullable=False, default=0)
+    duration_ms = Column(Integer, nullable=False, default=0)
+    response_preview = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(String, default=now, nullable=False)
+
+class BotActivityLog(Base):
+    __tablename__ = 'bot_activity_logs'
+    __table_args__ = (Index('ix_bot_activity_logs_bot_created', 'bot_id', 'created_at'),)
+    id = Column(String, primary_key=True, default=uid)
+    bot_id = Column(String, ForeignKey('bots.id'), nullable=False)
+    conversation_id = Column(String, ForeignKey('conversations.id'), nullable=True, index=True)
+    source = Column(String, nullable=False, default='chat')
+    event_type = Column(String, nullable=False)
+    severity = Column(String, nullable=False, default='info')
+    title = Column(String, nullable=False)
+    details = Column(JSON, default=dict)
+    created_at = Column(String, default=now, nullable=False)
 
 def get_db():
     with Session() as db:

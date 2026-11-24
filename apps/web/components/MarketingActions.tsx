@@ -17,10 +17,10 @@ export default function MarketingActions() {
   }, []);
 
   return <div className="marketing-actions">
-    <Link className="marketing-btn secondary marketing-account-link" href="/agents">
+    <Link className="marketing-btn secondary marketing-account-link" data-magnetic href="/agents">
       {account === undefined ? "Workspace" : account ? account.name : "Sign in"}
     </Link>
-    <Link className="marketing-btn primary" href="/agents">
+    <Link className="marketing-btn primary" data-magnetic href="/agents">
       {account ? "Open workspace" : "Start building"}<ArrowRight size={15}/>
     </Link>
   </div>;

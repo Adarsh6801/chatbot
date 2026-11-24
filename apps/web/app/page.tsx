@@ -1,25 +1,38 @@
 import Link from "next/link";
-import { Activity, ArrowRight, BookOpen, Bot, Check, Flame, MessageSquareText, ShieldCheck, Workflow } from "lucide-react";
+import { Activity, ArrowRight, BookOpen, Bot, Flame, MessageSquareText, ShieldCheck, Workflow } from "lucide-react";
+import AntigravityLayer from "@/components/AntigravityLayer";
 import MarketingActions from "@/components/MarketingActions";
+import LandingHero from "@/components/LandingHero";
 import "./landing.css";
 import "./marketing-nav.css";
+import "./antigravity.css";
 
 export const metadata = { title: "AgentForge — AI support grounded in your knowledge", description: "Build a support agent from your documents, design its workflow, and launch cited answers on your website." };
 
+const features = [
+  { icon: <BookOpen size={18}/>, title: "Connect your knowledge", copy: "Upload readable PDFs, documents, and text or import public web pages. Sources are indexed for search." },
+  { icon: <Workflow size={18}/>, title: "Design a conversation flow", copy: "Route questions, collect visitor details, check conditions, call your public APIs, and search your knowledge." },
+  { icon: <ShieldCheck size={18}/>, title: "See evidence and improve", copy: "Inspect source citations, review conversations, and improve content when the agent cannot answer confidently." },
+  { icon: <Activity size={18}/>, title: "Measure what happens", copy: "Review conversations, usage, retrieval checks, and signals from real visitor questions." },
+  { icon: <Bot size={18}/>, title: "Publish where customers are", copy: "Test in the playground, then publish and embed the agent on your website." },
+  { icon: <MessageSquareText size={18}/>, title: "Keep control in your hands", copy: "Manage each agent’s settings, deployment, plans, and workspace data from dedicated pages." },
+];
+
 export default function LandingPage() {
-  return <main className="marketing">
+  return <AntigravityLayer><main className="marketing">
     <header className="marketing-nav">
-      <Link href="/" className="marketing-logo"><span className="marketing-logo-mark"><Flame size={19}/></span>AgentForge<span style={{color:"#819554"}}>.</span></Link>
-      <nav className="marketing-links"><a href="#features">Features</a><Link href="/plans">Plans</Link><Link href="/about">About</Link></nav>
+      <Link href="/" className="marketing-logo"><span className="marketing-logo-mark"><Flame size={19}/></span>AgentForge<span className="marketing-logo-period">.</span></Link>
+      <nav className="marketing-links" aria-label="Main navigation"><a href="#features">Features</a><Link href="/plans">Plans</Link><Link href="/about">About</Link></nav>
       <MarketingActions />
     </header>
-    <section className="marketing-hero">
-      <div><span className="marketing-kicker">AI SUPPORT, GROUNDED IN YOUR KNOWLEDGE</span><h1>Turn your knowledge into <em>better answers.</em></h1><p>Build a support agent from your documents, test it in a visual workflow, and bring it to your website with cited answers your customers can trust.</p><div className="marketing-hero-actions"><Link className="marketing-btn primary" href="/agents">Create your first agent <ArrowRight size={16}/></Link><Link className="marketing-btn secondary" href="/about">Explore AgentForge</Link></div><div className="marketing-proof"><span><Check size={14}/>Cited responses</span><span><Check size={14}/>Your sources stay scoped</span><span><Check size={14}/>Start with a free plan</span></div></div>
-      <div className="marketing-preview" aria-label="Product dashboard preview"><div className="preview-top"><span className="preview-dots"><i/><i/><i/></span><strong>Support agent overview</strong><span className="preview-live">● LIVE</span></div><div className="preview-content"><div className="preview-metric-row"><div className="preview-metric"><small>Conversations</small><strong>1,284</strong></div><div className="preview-metric"><small>Knowledge sources</small><strong>12</strong></div><div className="preview-metric"><small>Grounded answers</small><strong>94%</strong></div></div><div className="preview-chart">{[35,52,42,67,55,81,63,92,73,100,82,94].map((h,i)=><i key={i} style={{height:`${h}%`}}/>)}</div><div className="preview-chat">I found the return window in your policy. You have 30 days to request a return. <strong>[1]</strong></div></div></div>
-    </section>
-    <section className="marketing-section alt" id="features"><div className="marketing-inner"><div className="marketing-section-heading"><span className="marketing-kicker">ONE WORKSPACE, END TO END</span><h2>Everything you need to build a helpful agent</h2><p>Keep the knowledge, conversations, and controls for each agent together in a workspace designed for the whole support lifecycle.</p></div><div className="marketing-feature-grid">{[[<BookOpen size={18}/> ,"Connect your knowledge","Upload readable PDFs, documents, and text or import public web pages. Sources are indexed for search."],[<Workflow size={18}/> ,"Design a conversation flow","Route questions, collect visitor details, check conditions, call your public APIs, and search your knowledge."],[<ShieldCheck size={18}/> ,"See evidence and improve","Inspect source citations, review conversations, and improve content when the agent cannot answer confidently."],[<Activity size={18}/> ,"Measure what happens","Review conversations, usage, retrieval checks, and signals from real visitor questions."],[<Bot size={18}/> ,"Publish where customers are","Test in the playground, then publish and embed the agent on your website."],[<MessageSquareText size={18}/> ,"Keep control in your hands","Manage each agent’s settings, deployment, plans, and workspace data from dedicated pages."]].map(([icon,title,copy]:any)=><article className="marketing-feature" key={title}><span className="marketing-feature-icon">{icon}</span><h3>{title}</h3><p>{copy}</p></article>)}</div></div></section>
-    <section className="marketing-section"><div className="marketing-inner"><div className="marketing-section-heading"><span className="marketing-kicker">A SIMPLE PATH TO LAUNCH</span><h2>From your documents to a live assistant</h2><p>Build a grounded agent in a few clear steps. You can start simple and add workflow logic when you need it.</p></div><div className="marketing-steps"><article className="marketing-step"><span>01 / ADD SOURCES</span><h3>Bring your knowledge</h3><p>Upload support guides, policies, product documentation, or other text-based sources.</p></article><article className="marketing-step"><span>02 / SHAPE ANSWERS</span><h3>Test and guide behavior</h3><p>Use the playground and visual workflow to tune routing, messages, and actions.</p></article><article className="marketing-step"><span>03 / GO LIVE</span><h3>Publish and learn</h3><p>Embed the agent, review conversations, and refine your knowledge from real questions.</p></article></div></div></section>
-    <section className="marketing-cta"><div><h2>Make your knowledge useful in every conversation.</h2><p>Create an agent, add a source, and try a grounded answer.</p></div><Link className="marketing-btn primary" href="/agents">Open your workspace <ArrowRight size={15}/></Link></section>
+
+    <LandingHero />
+
+    <section className="marketing-section alt" id="features"><div className="marketing-inner"><div className="marketing-section-heading"><span className="marketing-kicker">ONE WORKSPACE, END TO END</span><h2>Everything you need to build a helpful agent</h2><p>Keep the knowledge, conversations, and controls for each agent together in a workspace designed for the whole support lifecycle.</p></div><div className="marketing-feature-grid">{features.map((feature)=><article className="marketing-feature" data-tilt key={feature.title}><span className="marketing-feature-icon">{feature.icon}</span><h3>{feature.title}</h3><p>{feature.copy}</p><span className="feature-index">0{features.indexOf(feature)+1}</span></article>)}</div></div></section>
+
+    <section className="marketing-section"><div className="marketing-inner"><div className="marketing-section-heading"><span className="marketing-kicker">A SIMPLE PATH TO LAUNCH</span><h2>From your documents to a live assistant</h2><p>Build a grounded agent in a few clear steps. Start simple and add workflow logic when you need it.</p></div><div className="marketing-steps"><article className="marketing-step"><span>01 / ADD SOURCES</span><h3>Bring your knowledge</h3><p>Upload support guides, policies, product documentation, or other text-based sources.</p></article><article className="marketing-step"><span>02 / SHAPE ANSWERS</span><h3>Test and guide behavior</h3><p>Use the playground and visual workflow to tune routing, messages, and actions.</p></article><article className="marketing-step"><span>03 / GO LIVE</span><h3>Publish and learn</h3><p>Embed the agent, review conversations, and refine your knowledge from real questions.</p></article></div></div></section>
+
+    <section className="marketing-cta"><div><span className="marketing-kicker">YOUR KNOWLEDGE, READY TO HELP</span><h2>Make every answer useful and easy to trust.</h2><p>Create an agent, add a source, and try a grounded answer.</p></div><Link className="marketing-btn primary" data-magnetic href="/agents">Open your workspace <ArrowRight size={15}/></Link></section>
     <footer className="marketing-footer"><div className="marketing-footer-inner"><span>© {new Date().getFullYear()} AgentForge</span><div className="marketing-footer-links"><Link href="/about">About</Link><Link href="/plans">Plans</Link><Link href="/agents">Workspace</Link></div></div></footer>
-  </main>;
+  </main></AntigravityLayer>;
 }

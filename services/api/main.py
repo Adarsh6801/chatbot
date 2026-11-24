@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -15,7 +16,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 from .config import WEB_ORIGIN, PUBLIC_WEB_URL, PRODUCTION, PLANS
-from .database import Base, engine, Session, get_db, User, LoginSession, Bot, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, now
+from .database import Base, engine, Session, get_db, User, LoginSession, Bot, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, WorkflowApiLog, BotActivityLog, now
 from .security import current_user, owned_bot, password_hash, verify_password, digest, rate_limit
 from .ingestion import ingest, parse_file, eval_bot, MAX_BYTES
 from .rag import retrieve, rerank, generate, generate_stream, INJECTION
@@ -44,10 +45,12 @@ async def lifespan(app):
 app = FastAPI(title='AgentForge API', version='1.0.0', lifespan=lifespan)
 from .oauth import router as oauth_router
 app.include_router(oauth_router)
-from .workflow import router as workflow_router
+from .workflow import router as workflow_router, record_api_log, record_bot_log
 app.include_router(workflow_router)
 from .admin import router as admin_router
 app.include_router(admin_router)
+from .support import router as support_router
+app.include_router(support_router)
 from .billing import router as billing_router
 app.include_router(billing_router)
 from .payment_settings import get_payment_provider, payment_provider_status
@@ -188,6 +191,15 @@ def check_document_quota(db, user, extra=1):
 @app.get('/health')
 def health(): return {'status': 'ok', 'generation': 'openai' if os.getenv('OPENAI_API_KEY') else 'local-extractive'}
 
+@app.get('/api/v1/demo/pricing', tags=['demo'])
+def demo_pricing():
+    if PRODUCTION: raise HTTPException(404, 'Not found.')
+    return {'demo':True,'currency':'INR','plans':[
+        {'id':'demo-basic','name':'Basic (demo)','amount':0,'interval':'month'},
+        {'id':'demo-pro','name':'Pro (demo)','amount':499,'interval':'month'},
+        {'id':'demo-team','name':'Team (demo)','amount':1499,'interval':'month'},
+    ]}
+
 @app.post('/api/v1/auth/register', status_code=201)
 def register(body: AuthInput, request: Request, response: Response, db: DBSession = Depends(get_db)):
     rate_limit(db, 'register:' + (request.client.host if request.client else 'unknown'), 10, 3600)
@@ -238,6 +250,7 @@ def create_bot(body: BotInput, db: DBSession = Depends(get_db), user=Depends(cur
     bot = Bot(user_id=user.id, name=body.name.strip(), description=body.description, slug=slug)
     db.add(bot)
     db.commit()
+    record_bot_log(db,bot.id,'dashboard',None,{'event_type':'agent_created','severity':'info','title':'Agent created','details':{'name':bot.name}})
     return bot_data(bot, db)
 
 @app.get('/api/v1/bots/{bot_id}/identity-suggestions')
@@ -254,15 +267,17 @@ def get_bot(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_u
 @app.patch('/api/v1/bots/{bot_id}')
 def update_bot(bot_id: str, body: BotUpdate, db: DBSession = Depends(get_db), user=Depends(current_user)):
     bot = owned_bot(db, bot_id, user)
-    for key, value in body.model_dump(exclude_unset=True).items():
+    updates=body.model_dump(exclude_unset=True)
+    for key, value in updates.items():
         if value is not None: setattr(bot, key, value)
     db.commit()
+    if updates: record_bot_log(db,bot_id,'dashboard',None,{'event_type':'agent_settings','severity':'info','title':'Agent settings updated','details':{'fields':sorted(updates.keys())}})
     return bot_data(bot, db)
 
 @app.delete('/api/v1/bots/{bot_id}')
 def delete_bot(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
     bot = owned_bot(db, bot_id, user)
-    for model in (Message, Flag, EvalRun, Chunk, Document, Conversation, Workflow): db.query(model).filter_by(bot_id=bot.id).delete()
+    for model in (Message, Flag, EvalRun, Chunk, Document, WorkflowApiLog, BotActivityLog, Conversation, Workflow): db.query(model).filter_by(bot_id=bot.id).delete()
     db.delete(bot)
     db.commit()
     return {'ok': True}
@@ -281,6 +296,7 @@ def add_document(bot_id: str, body: SourceInput, tasks: BackgroundTasks, db: DBS
     db.add(doc)
     db.commit()
     dispatch(tasks, doc.id)
+    record_bot_log(db,bot_id,'dashboard',None,{'event_type':'knowledge_source','severity':'info','title':'Knowledge source added','details':{'document_id':doc.id,'name':doc.name,'source_type':doc.source_type}})
     return doc_data(doc)
 
 @app.post('/api/v1/bots/{bot_id}/documents/upload', status_code=202)
@@ -290,7 +306,9 @@ async def upload_document(bot_id: str, tasks: BackgroundTasks, file: UploadFile 
     raw = await file.read(MAX_BYTES + 1)
     name = Path(file.filename or 'document.txt').name[:200]
     try: text = await asyncio.to_thread(parse_file, name, raw)
-    except Exception: raise HTTPException(422, 'Invalid document. Use a readable PDF, DOCX, TXT, or Markdown file under 10 MB.')
+    except Exception as error:
+        record_bot_log(db,bot_id,'dashboard',None,{'event_type':'error','severity':'error','title':'Knowledge file could not be read','details':{'name':name,'error_type':type(error).__name__}})
+        raise HTTPException(422, 'Invalid document. Use a readable PDF, DOCX, TXT, or Markdown file under 10 MB.')
     doc = Document(bot_id=bot_id, name=name, content=text, source_type=name.rsplit('.', 1)[-1].lower())
     db.add(doc)
     db.commit()
@@ -299,10 +317,13 @@ async def upload_document(bot_id: str, tasks: BackgroundTasks, file: UploadFile 
             doc.source_uri = await asyncio.to_thread(store_raw, doc.id, name, raw)
             db.commit()
         except Exception:
+            logging.getLogger('agentforge').exception('S3 raw upload failed for document %s', doc.id)
             db.delete(doc)
             db.commit()
+            record_bot_log(db,bot_id,'dashboard',None,{'event_type':'error','severity':'error','title':'Raw file storage failed','details':{'document_id':doc.id,'name':name,'stage':'s3_upload'}})
             raise HTTPException(502, 'Raw file storage failed. Please try again.')
     dispatch(tasks, doc.id)
+    record_bot_log(db,bot_id,'dashboard',None,{'event_type':'knowledge_source','severity':'info','title':'Knowledge file uploaded','details':{'document_id':doc.id,'name':name,'bytes':len(raw),'status':doc.status}})
     return doc_data(doc)
 
 @app.delete('/api/v1/bots/{bot_id}/documents/{doc_id}')
@@ -310,11 +331,13 @@ def delete_document(bot_id: str, doc_id: str, db: DBSession = Depends(get_db), u
     owned_bot(db, bot_id, user)
     doc = db.query(Document).filter_by(id=doc_id, bot_id=bot_id).first()
     if not doc: raise HTTPException(404, 'Document not found.')
+    deleted_name=doc.name
     db.query(Chunk).filter_by(document_id=doc_id).delete()
     db.delete(doc)
     db.flush()
     eval_bot(db, bot_id)
     db.commit()
+    record_bot_log(db,bot_id,'dashboard',None,{'event_type':'knowledge_source','severity':'info','title':'Knowledge source deleted','details':{'document_id':doc_id,'name':deleted_name}})
     return {'ok': True}
 
 @app.post('/api/v1/bots/{bot_id}/retrain', status_code=202)
@@ -325,6 +348,7 @@ def retrain(bot_id: str, tasks: BackgroundTasks, db: DBSession = Depends(get_db)
         doc.status = 'PENDING'
     db.commit()
     for doc in docs: dispatch(tasks, doc.id)
+    record_bot_log(db,bot_id,'dashboard',None,{'event_type':'knowledge_source','severity':'info','title':'Knowledge sources queued for reindexing','details':{'source_count':len(docs)}})
     return {'queued': len(docs)}
 
 @app.get('/api/v1/public/bots/{slug}')
@@ -342,6 +366,16 @@ def widget_config(key: str, db: DBSession = Depends(get_db)):
 @app.options('/api/v1/chat/{key}')
 def chat_options(key: str):
     return Response(headers={'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type'})
+
+AGENT_IDENTITY_QUESTION = re.compile(r"\b(?:who\s+are\s+you|what\s+is\s+your\s+name|what's\s+your\s+name|what\s+are\s+you|introduce\s+yourself|tell\s+me\s+about\s+yourself|what\s+do\s+you\s+do|what\s+can\s+you\s+(?:do|help\s+with))\b", re.I)
+
+def agent_identity_answer(bot, message):
+    if not AGENT_IDENTITY_QUESTION.search(message): return None
+    name = (bot.name or 'this assistant').strip()
+    description = (bot.description or '').strip()
+    if description:
+        return f"I'm {name}, an AI assistant. {description}"
+    return f"I'm {name}, an AI assistant. I answer questions using the knowledge sources connected to this agent."
 
 @app.post('/api/v1/chat/{key}')
 async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depends(get_db)):
@@ -368,34 +402,47 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
     history = db.query(Message).filter_by(conversation_id=conversation.id).order_by(Message.created_at.desc()).limit(40).all()[::-1]
     db.add(Message(conversation_id=conversation.id, bot_id=bot.id, role='user', content=body.message))
     db.commit()
+    record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'message_received','severity':'info','title':'Visitor message received','details':{'message_length':len(body.message),'workflow_enabled':bool(db.query(Workflow).filter_by(bot_id=bot.id,enabled=1).first())}})
     start = time.perf_counter()
     blocked = bool(INJECTION.search(body.message))
+    identity_answer = None if blocked else agent_identity_answer(bot, body.message)
     workflow_result=None
     workflow=db.query(Workflow).filter_by(bot_id=bot.id,enabled=1).first()
-    if workflow and workflow.published_graph and not blocked:
+    if workflow and workflow.published_graph and not blocked and not identity_answer:
         from .workflow import run_graph,knowledge_answer
         state=conversation.workflow_state or {}
         if state.get('version')!=workflow.version: state={}
-        workflow_result=await run_graph(workflow.published_graph,body.message,state,lambda q:knowledge_answer(db,bot,q))
+        workflow_result=await run_graph(workflow.published_graph,body.message,state,lambda q:knowledge_answer(db,bot,q),api_log=lambda event:record_api_log(db,bot.id,'chat',conversation.id,event),activity_log=lambda event:record_bot_log(db,bot.id,'chat',conversation.id,event))
         conversation.workflow_state=workflow_result['state']|{'version':workflow.version}
         db.commit()
-    try: hits = [] if blocked or workflow_result else await hybrid_search(db, bot.id, body.message)
-    except (httpx.HTTPError, ValueError): raise HTTPException(502, 'Retrieval provider is unavailable. Please try again.')
+    try: hits = [] if blocked or workflow_result or identity_answer else await hybrid_search(db, bot.id, body.message)
+    except (httpx.HTTPError, ValueError) as error:
+        record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'error','severity':'error','title':'Knowledge retrieval failed','details':{'error_type':type(error).__name__}})
+        raise HTTPException(502, 'Retrieval provider is unavailable. Please try again.')
     try: hits = await rerank(body.message, hits)
     except httpx.HTTPError: hits = hits[:8]
     hits = [h for h in hits if h['confidence'] >= min(0.12, bot.threshold)]
-    confidence = max((h['confidence'] for h in hits), default=0)
-    abstain = blocked or confidence < bot.threshold
+    confidence = 1.0 if identity_answer else max((h['confidence'] for h in hits), default=0)
+    abstain = blocked or (not identity_answer and confidence < bot.threshold)
     citations = [{'id': h['chunk'].id, 'index': i+1, 'document_id': h['chunk'].document_id, 'source': db.get(Document, h['chunk'].document_id).name, 'excerpt': h['chunk'].content[:500]} for i, h in enumerate(hits)] if not abstain else []
     if workflow_result:
         confidence=workflow_result['confidence'];citations=workflow_result['citations'];abstain=workflow_result['abstained']
+    elif not blocked:
+        record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'knowledge_search','severity':'warning' if abstain else 'info','title':'Knowledge search completed','details':{'result_count':len(hits),'confidence':round(confidence,4),'citation_count':len(citations),'abstained':abstain,'identity_response':bool(identity_answer)}})
+    else:
+        record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'error','severity':'warning','title':'Message blocked by safety rules','details':{'reason':'prompt_injection'}})
     conv_id, bot_id, system_prompt = conversation.id, bot.id, bot.system_prompt
     db.close()
     async def stream():
         def event(kind, data): return f'event: {kind}\ndata: {json.dumps(data)}\n\n'
         yield event('meta', {'conversation_id': conv_id, 'confidence': round(confidence, 3), 'citations': citations})
         try:
-            if workflow_result:
+            if identity_answer:
+                answer=identity_answer;model='agent-profile';tokens=len(answer.split());cost=0
+                for piece in re.findall(r'\S+\s*|\s+',answer):
+                    yield event('token',{'text':piece})
+                    await asyncio.sleep(0.005)
+            elif workflow_result:
                 answer=workflow_result['answer'];model=workflow_result['model'];tokens=workflow_result['tokens'] or len(answer.split());cost=workflow_result['cost']
                 yield event('workflow', {'trace':workflow_result['trace']})
                 for piece in re.findall(r'\S+\s*|\s+',answer):
@@ -424,13 +471,16 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
                 answer_words = set(words(answer))
                 support = len(answer_words & evidence_words) / max(len(answer_words),1)
                 missing_citations = bool(hits) and not re.search(r'\[\d+\]',answer)
-                reason = 'prompt_injection' if blocked else 'no_answer' if abstain or re.search(r"\b(I don't know|I do not know)\b",answer,re.I) else 'possible_hallucination' if not workflow_result and model != 'local-extractive' and (support < 0.25 or missing_citations) else 'low_confidence' if confidence < 0.5 else 'negative_sentiment' if re.search(r'\b(angry|useless|terrible|frustrated|hate)\b', body.message, re.I) else None
+                reason = 'prompt_injection' if blocked else 'no_answer' if abstain or re.search(r"\b(I don't know|I do not know)\b",answer,re.I) else 'possible_hallucination' if not identity_answer and not workflow_result and model != 'local-extractive' and (support < 0.25 or missing_citations) else 'low_confidence' if confidence < 0.5 else 'negative_sentiment' if re.search(r'\b(angry|useless|terrible|frustrated|hate)\b', body.message, re.I) else None
                 if reason: store.add(Flag(bot_id=bot_id, question=body.message, reason=reason))
                 store.commit()
+                record_bot_log(store,bot_id,'chat',conv_id,{'event_type':'assistant_response','severity':'warning' if abstain else 'info','title':'Agent response sent','details':{'model':model,'latency_ms':latency,'tokens':tokens,'confidence':round(confidence,4),'citation_count':len(citations),'abstained':abstain}})
                 trace_id = stored.id
             await export_trace(trace_id, bot_id, body.message, answer, {'model':model,'tokens':tokens,'cost_cents':cost,'latency_ms':latency,'confidence':confidence,'abstained':abstain})
             yield event('done', {'tokens': tokens, 'cost_cents': cost, 'latency_ms': latency, 'model': model, 'abstained': abstain})
-        except Exception:
+        except Exception as error:
+            with Session() as log_db:
+                record_bot_log(log_db,bot_id,'chat',conv_id,{'event_type':'error','severity':'error','title':'Chat response failed','details':{'error_type':type(error).__name__}})
             yield event('error', {'message': 'The response could not be completed. Please try again.'})
     return StreamingResponse(stream(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 

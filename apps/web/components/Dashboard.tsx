@@ -21,6 +21,8 @@ import {
   LogOut,
   MessageSquare,
   MoreHorizontal,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   Search,
   Settings2,
@@ -30,16 +32,24 @@ import {
   Upload,
   UserRound,
   ChevronDown,
+  CheckCircle2,
+  CircleAlert,
+  CircleHelp,
+  Clock3,
+  RefreshCw,
   X,
   Zap,
 } from "lucide-react";
 import Chat from "@/components/Chat";
 import WorkflowStudio from "@/components/WorkflowStudio";
+import SupportCenter from "@/components/SupportCenter";
 import AccountProfile, { UserProfile } from "@/components/AccountProfile";
+import { useDialogs } from "@/components/Dialogs";
 import AuthGate from "@/components/AuthGate";
 import "@/components/account.css";
 import { api, API, Bot } from "@/lib/api";
 import "@/components/workspace-polish.css";
+import "@/components/support.css";
 
 type User = UserProfile;
 type Section =
@@ -48,27 +58,29 @@ type Section =
   | "conversations"
   | "billing"
   | "keys"
-  | "profile";
+  | "profile"
+  | "support";
 const tabs = [
   "Workflow",
   "Knowledge",
   "Playground",
   "Analytics",
   "Conversations",
+  "Logs",
   "Improve",
   "Deploy",
   "Settings",
 ];
 const tabSlugs: Record<string, string> = {
   Workflow: "workflow", Knowledge: "knowledge", Playground: "playground",
-  Analytics: "analytics", Conversations: "conversations", Improve: "improve",
+  Analytics: "analytics", Conversations: "conversations", Logs: "logs", Improve: "improve",
   Deploy: "deploy", Settings: "settings",
 };
 const slugTabs = Object.fromEntries(Object.entries(tabSlugs).map(([tab, slug]) => [slug, tab]));
 const agentPageCache = new Map<string, any>();
 const sectionPaths: Record<Section, string> = {
   agents: "/agents", analytics: "/analytics", conversations: "/conversations",
-  billing: "/plans", keys: "/api-keys", profile: "/profile",
+  billing: "/plans", keys: "/api-keys", profile: "/profile", support: "/support",
 };
 const demoText = `AgentForge helps teams build support agents grounded in their own documents. You can upload PDF, DOCX, text, and Markdown files or import a public website page. Each answer includes citations so visitors can check its evidence.\n\nThe Free plan includes 1 agent, 10 documents, and 100 messages per month. The Pro plan includes 10 agents, 100 documents, and 5,000 messages per month. The Team plan includes 50 agents, 500 documents, and 25,000 messages per month.\n\nTo install your agent on a website, publish it from the Deploy tab, copy the embed script, and paste it before the closing body tag. You can also share the hosted chat link. Customize the greeting, accent color, and widget position from Settings.\n\nIf an agent cannot find an answer in its documents, it says it does not know and flags the question. Open Improve, write a verified answer, and save it to train the agent on the missing information.\n\nFor help, contact your AgentForge workspace administrator. Documents remain scoped to their agent and owner. The local demo uses extractive answers and does not send your documents to an AI provider unless an OpenAI API key is configured.`;
 
@@ -88,6 +100,47 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
     [busy, setBusy] = useState(false),
     [usage, setUsage] = useState<any>(null);
   const [accountMenu, setAccountMenu] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [agentMenu, setAgentMenu] = useState<{ bot: Bot; x: number; y: number } | null>(null);
+  const { confirm: confirmDialog } = useDialogs();
+  useEffect(() => {
+    setSidebarCollapsed(window.localStorage.getItem("agentforge-sidebar-collapsed") === "true");
+  }, []);
+  function toggleSidebar() {
+    setSidebarCollapsed((collapsed) => {
+      const next = !collapsed;
+      window.localStorage.setItem("agentforge-sidebar-collapsed", String(next));
+      return next;
+    });
+  }
+  useEffect(() => {
+    if (!agentMenu) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setAgentMenu(null); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [agentMenu]);
+  function showAgentMenu(event: React.MouseEvent<HTMLElement>, bot: Bot) {
+    event.preventDefault();
+    event.stopPropagation();
+    setAgentMenu({ bot, x: Math.max(12, Math.min(event.clientX, window.innerWidth - 205)), y: Math.max(12, Math.min(event.clientY, window.innerHeight - 115)) });
+  }
+  async function deleteAgent(bot: Bot) {
+    const accepted = await confirmDialog({
+      title: `Delete “${bot.name}”?`,
+      description: "This permanently removes the agent, its knowledge sources, and conversation history.",
+      confirmText: "Delete agent",
+      tone: "danger",
+    });
+    setAgentMenu(null);
+    if (!accepted) return;
+    await action(async () => {
+      await api(`/bots/${bot.id}`, { method: "DELETE" });
+      if (selected?.id === bot.id) {
+        setSelected(null);
+        router.replace("/agents");
+      }
+    }, "Agent deleted.");
+  }
   function navigateSection(next: Section) {
     setSection(next);
     setSelected(null);
@@ -117,6 +170,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
     const routeSections: Record<string, Section> = {
       analytics: "analytics", conversations: "conversations", plans: "billing",
       "api-keys": "keys", profile: "profile",
+      support: "support",
     };
     const next = routeSections[parts[0]];
     if (next) { setSection(next); setSelected(null); }
@@ -198,14 +252,19 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
     (b.name + " " + b.description).toLowerCase().includes(query.toLowerCase()),
   );
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
-        <a className="brand" href="/" aria-label="AgentForge home">
-          <div className="brand-icon">
-            <Flame size={22} />
-          </div>
-          AgentForge<span className="brand-dot">.</span>
-        </a>
+        <div className="sidebar-brand-row">
+          <a className="brand" href="/" aria-label="AgentForge home">
+            <div className="brand-icon">
+              <Flame size={22} />
+            </div>
+            <span className="brand-name">AgentForge<span className="brand-dot">.</span></span>
+          </a>
+          <button className="sidebar-toggle" onClick={toggleSidebar} aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
+            {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          </button>
+        </div>
         <div className="workspace-switch">
           <div className="workspace-avatar">{user.name[0].toUpperCase()}</div>
           <div>
@@ -227,6 +286,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
               key={id}
               className={section === id ? "active" : ""}
               onClick={() => navigateSection(id)}
+              title={label}
             >
               <Icon size={18} />
               {label}
@@ -236,11 +296,18 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
             </button>
           ))}
         </nav>
+        <div className="nav-label management">HELP</div>
+        <nav>
+          <button className={section === "support" ? "active" : ""} onClick={() => navigateSection("support")} title="Support">
+            <CircleHelp size={18} />Support
+          </button>
+        </nav>
         <div className="nav-label management">MANAGE</div>
         <nav>
           <button
             className={section === "billing" ? "active" : ""}
             onClick={() => navigateSection("billing")}
+            title="Usage & billing"
           >
             <Zap size={18} />
             Usage & billing
@@ -248,6 +315,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
           <button
             className={section === "keys" ? "active" : ""}
             onClick={() => navigateSection("keys")}
+            title="API keys"
           >
             <KeyRound size={18} />
             API keys
@@ -340,8 +408,10 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                   ? "My agents"
                   : section === "keys"
                     ? "API keys"
-                    : section === "billing"
+                      : section === "billing"
                       ? "Usage & billing"
+                      : section === "support"
+                        ? "Support"
                       : section[0].toUpperCase() + section.slice(1)}
             </strong>
           </div>
@@ -548,10 +618,14 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
               </div>
               <div className="agent-grid">
                 {filtered.map((bot, i) => (
-                  <button
+                  <div
                     className="agent-card"
                     key={bot.id}
                     onClick={() => navigateAgent(bot, "Workflow")}
+                    onContextMenu={(event) => showAgentMenu(event, bot)}
+                    onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); navigateAgent(bot, "Workflow"); } }}
+                    role="button"
+                    tabIndex={0}
                   >
                     <div className="agent-card-top">
                       <div className={"bot-avatar tint-" + (i % 3)}>
@@ -565,7 +639,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                         <i />
                         {bot.published ? "Live" : "Draft"}
                       </span>
-                      <MoreHorizontal className="card-more" size={18} />
+                      <button type="button" className="card-more-button" aria-label={`Actions for ${bot.name}`} title="Agent actions" onClick={(event) => showAgentMenu(event, bot)}><MoreHorizontal className="card-more" size={18} /></button>
                     </div>
                     <h3>{bot.name}</h3>
                     <p>
@@ -586,7 +660,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                       <span>Open workspace</span>
                       <ArrowRight size={17} />
                     </div>
-                  </button>
+                  </div>
                 ))}
                 <button
                   className="new-agent-card"
@@ -599,6 +673,13 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                   <span>Put your knowledge to work</span>
                 </button>
               </div>
+              {agentMenu && <>
+                <button className="agent-menu-dismiss" aria-label="Close agent actions" onClick={() => setAgentMenu(null)} />
+                <div className="agent-context-menu" role="menu" style={{ left: agentMenu.x, top: agentMenu.y }} onClick={(event) => event.stopPropagation()}>
+                  <button role="menuitem" onClick={() => { const bot = agentMenu.bot; setAgentMenu(null); navigateAgent(bot, "Workflow"); }}><ArrowRight size={14}/>Open workspace</button>
+                  <button role="menuitem" className="delete" onClick={() => void deleteAgent(agentMenu.bot)}><Trash2 size={14}/>Delete agent</button>
+                </div>
+              </>}
               {query && !filtered.length && (
                 <p className="muted">No agents match “{query}”.</p>
               )}
@@ -645,6 +726,8 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                 workspace. Answers are backed by sources.
               </div>
             </>
+          ) : section === "support" ? (
+            <SupportCenter />
           ) : section === "profile" ? (
             <AccountProfile
               user={user}
@@ -824,6 +907,8 @@ function AgentDetail({
   busy: boolean;
   notify: (s: string) => void;
 }) {
+  const { confirm: confirmDialog } = useDialogs();
+  const router = useRouter();
   const [page, setPage] = useState(1);
   const cacheKey = `${bot.id}:${tab}:${page}`;
   const [data, setData] = useState<any>(() => agentPageCache.get(cacheKey) ?? null),
@@ -871,6 +956,7 @@ function AgentDetail({
   }
   if (loadError) return <div className="error">{loadError}</div>;
   if (tab === "Workflow") return <WorkflowStudio bot={bot} notify={notify} />;
+  if (tab === "Logs") return <AgentLogs bot={bot} />;
   if (tab === "Playground")
     return (
       <div className="playground">
@@ -962,10 +1048,8 @@ function AgentDetail({
                   <button
                     className="icon-button"
                     title="Delete source"
-                    onClick={() => {
-                      if (
-                        confirm("Delete this source and its searchable chunks?")
-                      )
+                    onClick={async () => {
+                      if (await confirmDialog({ title: "Delete this source?", description: "This also removes its searchable chunks from this agent.", confirmText: "Delete source", tone: "danger" }))
                         mutate(
                           () =>
                             api(base + "/documents/" + d.id, {
@@ -1510,15 +1594,12 @@ function AgentDetail({
             type="button"
             className="danger"
             disabled={busy}
-            onClick={() => {
-              if (
-                confirm(
-                  "Permanently delete this agent, its sources, and conversation history?",
-                )
-              )
+            onClick={async () => {
+              if (await confirmDialog({ title: `Delete “${bot.name}”?`, description: "This permanently removes the agent, its knowledge sources, and conversation history.", confirmText: "Delete agent", tone: "danger" }))
                 action(async () => {
                   await api(base, { method: "DELETE" });
                   await refresh();
+                  router.replace("/agents");
                 }, "Agent deleted.");
             }}
           >
@@ -1528,6 +1609,57 @@ function AgentDetail({
       </form>
     );
   return null;
+}
+
+function AgentLogs({ bot }: { bot: Bot }) {
+  const [hours, setHours] = useState(24);
+  const [status, setStatus] = useState("all");
+  const [eventType, setEventType] = useState("all");
+  const [offset, setOffset] = useState(0);
+  const [items, setItems] = useState<any[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const limit = 50;
+  async function load(showLoading = false) {
+    if (showLoading) setLoading(true);
+    try {
+      const result = await api<any>(`/bots/${bot.id}/workflow/logs?hours=${hours}&status=${status}&event_type=${eventType}&limit=${limit}&offset=${offset}`);
+      setItems(result.items || []);
+      setTotal(result.total || 0);
+      setError("");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => {
+    void load(true);
+    const timer = window.setInterval(() => void load(false), 30000);
+    return () => window.clearInterval(timer);
+  }, [bot.id, hours, status, eventType, offset]); // eslint-disable-line
+  return <section className="agent-logs">
+    <div className="agent-logs-heading">
+      <div><span className="eyebrow">BOT ACTIVITY</span><h2>Agent logs</h2><p>Review conversations, retrievals, workflow steps, API calls, and errors. Logs are automatically removed after 24 hours.</p></div>
+      <div className="agent-logs-controls">
+        <label>Time range<select value={hours} onChange={e=>{setOffset(0);setHours(Number(e.target.value));}}><option value={1}>Last hour</option><option value={6}>Last 6 hours</option><option value={12}>Last 12 hours</option><option value={24}>Last 24 hours</option></select></label>
+        <label>Event<select value={eventType} onChange={e=>{setOffset(0);setEventType(e.target.value);}}><option value="all">All events</option><option value="message_received">Visitor messages</option><option value="assistant_response">Agent responses</option><option value="knowledge_search">Knowledge searches</option><option value="knowledge_source">Knowledge sources</option><option value="workflow_step">Workflow steps</option><option value="api_call">API calls</option><option value="workflow_saved">Workflow saved</option><option value="workflow_published">Workflow published</option><option value="workflow_enabled">Workflow enabled/disabled</option><option value="agent_created">Agent created</option><option value="agent_settings">Agent settings updated</option><option value="error">Errors</option></select></label>
+        <label>Result<select value={status} onChange={e=>{setOffset(0);setStatus(e.target.value);}}><option value="all">All results</option><option value="success">Successful</option><option value="error">Errors only</option></select></label>
+        <button className="secondary agent-logs-refresh" onClick={()=>void load(true)}><RefreshCw size={14}/>Refresh</button>
+      </div>
+    </div>
+    <div className="agent-logs-summary"><span><strong>{total}</strong> {status==='error'||eventType==='error'?'errors':'events'} in the selected range</span><span><Clock3 size={14}/>Refreshes every 30 seconds</span></div>
+    {error&&<div className="error" role="alert">{error}</div>}
+    {loading?<div className="agent-logs-empty">Loading agent logs…</div>:!items.length?<div className="agent-logs-empty"><Activity size={24}/><strong>No bot activity in this time range</strong><span>Visitor messages, agent responses, workflow steps, knowledge-source updates, API results, and errors appear here.</span></div>:
+      <div className="agent-log-list">{items.map((item:any)=><article className={'agent-log '+(item.success?'success':'failed')} key={item.id}>
+        <div className="agent-log-main"><span className={'agent-log-icon '+(item.success?'success':'failed')}>{item.success?<CheckCircle2 size={17}/>:<CircleAlert size={17}/>}</span><div className="agent-log-title"><strong>{item.title||item.node_name||item.event_type.replace(/_/g,' ')}</strong><div>{item.event_type==='api_call'?<><code>{item.method||'API'}</code><span className="agent-log-url">{item.url}</span></>:<><span className="agent-log-type">{item.event_type.replace(/_/g,' ')}</span>{item.details?.type&&<span className="agent-log-type">{item.details.type}</span>}</>}</div></div><span className={'agent-log-status '+(item.success?'success':'failed')}>{item.status_code||String(item.severity||'info').toUpperCase()}</span></div>
+        <div className="agent-log-meta"><time>{new Date(item.created_at).toLocaleString()}</time>{(item.duration_ms||item.details?.latency_ms)&&<span>{item.duration_ms||item.details?.latency_ms} ms</span>}<span className="agent-log-source">{item.source==='playground'?'Playground test':item.source==='dashboard'?'Dashboard':item.source==='worker'?'Ingestion worker':'Visitor chat'}</span></div>
+        {item.error&&<div className="agent-log-error">{item.error}</div>}
+        <details className="agent-log-response"><summary>{item.event_type==='api_call'?(item.success?'View API response':'View error response'):'View event details'}</summary><pre>{item.event_type==='api_call'?(item.response_preview||item.error||'No response body was received.'):JSON.stringify(item.details||{},null,2)}</pre></details>
+      </article>)}</div>}
+    <div className="agent-logs-pagination"><button className="secondary" disabled={offset===0||loading} onClick={()=>setOffset(Math.max(0,offset-limit))}>Previous</button><span>{total?`${offset+1}–${Math.min(offset+items.length,total)} of ${total}`:'0 results'}</span><button className="secondary" disabled={offset+items.length>=total||loading} onClick={()=>setOffset(offset+limit)}>Next</button></div>
+  </section>;
 }
 
 function EvalPanel({ base }: { base: string }) {
@@ -1722,6 +1854,7 @@ function Keys({
   action: (fn: () => Promise<any>, s?: string) => Promise<void>;
   notify: (s: string) => void;
 }) {
+  const { confirm: confirmDialog } = useDialogs();
   const [keys, setKeys] = useState<any[]>([]),
     [newKey, setNewKey] = useState("");
   const load = () => api<any[]>("/account/keys").then(setKeys);
@@ -1794,8 +1927,8 @@ function Keys({
               </div>
               <button
                 className="danger"
-                onClick={() => {
-                  if (confirm("Revoke this API key?"))
+                onClick={async () => {
+                  if (await confirmDialog({ title: "Revoke this API key?", description: "Applications using this key will lose access immediately.", confirmText: "Revoke key", tone: "danger" }))
                     action(async () => {
                       await api("/account/keys/" + k.id, { method: "DELETE" });
                       await load();

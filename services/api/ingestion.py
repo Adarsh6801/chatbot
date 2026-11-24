@@ -117,6 +117,8 @@ async def ingest(document_id):
                 db.flush()
                 eval_bot(db, doc.bot_id)
                 db.commit()
+                from .workflow import record_bot_log
+                record_bot_log(db,doc.bot_id,'worker',None,{'event_type':'knowledge_source','severity':'info','title':'Knowledge source indexed','details':{'document_id':doc.id,'name':doc.name,'chunks':len(chunks),'embedding_model':model}})
                 import os, logging
                 if os.getenv('EVAL_PROVIDER') == 'openai':
                     try:
@@ -133,8 +135,11 @@ async def ingest(document_id):
                 with Session() as db:
                     doc = db.get(Document, document_id)
                     if doc:
+                        bot_id,name=doc.bot_id,doc.name
                         doc.status = 'FAILED'
                         doc.error = str(error)[:300] if isinstance(error, ValueError) else 'Ingestion failed. Check the URL or file and retry.'
                         db.commit()
+                        from .workflow import record_bot_log
+                        record_bot_log(db,bot_id,'worker',None,{'event_type':'knowledge_source','severity':'error','title':'Knowledge source indexing failed','details':{'document_id':document_id,'name':name,'error_type':type(error).__name__,'error':str(error)[:500] if isinstance(error,ValueError) else 'Ingestion failed. Check the URL or file and retry.'}})
                 return
             await asyncio.sleep(2 ** attempt)

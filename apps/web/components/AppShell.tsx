@@ -7,7 +7,7 @@ import { api } from "@/lib/api";
 
 function isWorkspacePath(pathname: string) {
   return pathname === "/agents" || pathname.startsWith("/agents/") ||
-    ["/analytics", "/conversations", "/api-keys", "/profile"].includes(pathname);
+    ["/analytics", "/conversations", "/api-keys", "/profile", "/support"].includes(pathname);
 }
 
 export default function AppShell({ children }: { children: React.ReactNode }) {

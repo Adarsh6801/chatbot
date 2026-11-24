@@ -77,6 +77,8 @@ Create an account with a password of at least 10 characters. Click **Try a demo*
 
 See [workflow guide](docs/WORKFLOWS.md) for configuration and runtime behavior.
 
+The proposed student learning portal is documented separately in [Phase Two: Student Learning Platform](docs/PHASE_2_STUDENT_LEARNING_PLATFORM.md). It is a planning specification; learner functionality is not implemented by this document.
+
 ## Configuration
 
 Copy `.env.example` to `.env` at the repository root. The API reads this file on startup. For the frontend, put `NEXT_PUBLIC_API_URL` into `apps/web/.env.local` when changing the API host (Next.js loads environment files from that directory). `NEXT_PUBLIC_*` values are baked into production builds.
