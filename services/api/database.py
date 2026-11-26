@@ -40,6 +40,10 @@ class User(Base):
     subscription_id = Column(String, nullable=True)
     razorpay_subscription_id = Column(String, nullable=True)
     billing_provider = Column(String, default='stripe', nullable=False)
+    free_started_at = Column(String, nullable=True)
+    free_trial_used = Column(Integer, default=0, nullable=False)
+    topup_tokens = Column(Integer, default=0, nullable=False)
+    subscription_tokens = Column(Integer, default=0, nullable=False)
     avatar_url = Column(Text, default='')
     bio = Column(Text, default='')
     company = Column(String, default='')
@@ -177,6 +181,34 @@ class Payment(Base):
     plan = Column(String, nullable=False, default='')
     amount = Column(Integer, nullable=True)
     currency = Column(String, nullable=True)
+    kind = Column(String, nullable=False, default='subscription')
+    tokens = Column(Integer, nullable=True)
+    created_at = Column(String, default=now, nullable=False, index=True)
+
+class BillingAttempt(Base):
+    __tablename__ = 'billing_attempts'
+    id = Column(String, primary_key=True, default=uid)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    provider = Column(String, nullable=False, index=True)
+    provider_reference = Column(String, nullable=False, index=True)
+    plan = Column(String, nullable=False)
+    status = Column(String, nullable=False, default='pending', index=True)
+    checkout_url = Column(Text, nullable=True)
+    paid_count = Column(Integer, nullable=False, default=0)
+    amount = Column(Integer, nullable=True)
+    currency = Column(String, nullable=True)
+    created_at = Column(String, default=now, nullable=False, index=True)
+    updated_at = Column(String, default=now, nullable=False)
+
+class TokenUsage(Base):
+    __tablename__ = 'token_usage'
+    id = Column(String, primary_key=True, default=uid)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    message_id = Column(String, ForeignKey('messages.id'), nullable=True, index=True)
+    tokens = Column(Integer, nullable=False)
+    subscription_tokens = Column(Integer, nullable=False, default=0)
+    topup_tokens = Column(Integer, nullable=False, default=0)
+    source = Column(String, nullable=False)
     created_at = Column(String, default=now, nullable=False, index=True)
 
 class AdminAudit(Base):
@@ -214,6 +246,29 @@ class AppSetting(Base):
     __tablename__ = 'app_settings'
     key = Column(String, primary_key=True)
     value = Column(Text, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
+
+class DocumentationCategory(Base):
+    __tablename__ = 'documentation_categories'
+    id = Column(String, primary_key=True, default=uid)
+    title = Column(String, nullable=False)
+    slug = Column(String, unique=True, nullable=False, index=True)
+    description = Column(Text, default='', nullable=False)
+    position = Column(Integer, default=0, nullable=False)
+    created_at = Column(String, default=now, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
+
+class DocumentationPage(Base):
+    __tablename__ = 'documentation_pages'
+    id = Column(String, primary_key=True, default=uid)
+    category_id = Column(String, ForeignKey('documentation_categories.id', ondelete='CASCADE'), nullable=False, index=True)
+    title = Column(String, nullable=False)
+    slug = Column(String, unique=True, nullable=False, index=True)
+    summary = Column(Text, default='', nullable=False)
+    content = Column(Text, nullable=False, default='')
+    status = Column(String, nullable=False, default='published', index=True)
+    position = Column(Integer, default=0, nullable=False)
+    created_at = Column(String, default=now, nullable=False)
     updated_at = Column(String, default=now, nullable=False)
 
 class Workflow(Base):

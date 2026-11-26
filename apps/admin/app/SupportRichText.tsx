@@ -23,6 +23,12 @@ export function SupportMessageView({ text }: { text: string }) {
   for (let i = 0; i < lines.length;) {
     const line = lines[i];
     if (!line.trim()) { i++; continue; }
+    if (/^```/.test(line)) {
+      const code: string[] = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i])) code.push(lines[i++]);
+      if (i < lines.length) i++;
+      blocks.push(<pre key={`code-${i}`}><code>{code.join("\n")}</code></pre>); continue;
+    }
     const heading = line.match(/^(#{1,3})\s+(.+)$/);
     if (heading) { const Tag = `h${heading[1].length}` as "h1" | "h2" | "h3"; blocks.push(<Tag key={i}>{inline(heading[2], `h${i}`)}</Tag>); i++; continue; }
     if (/^\s*[-*]\s+/.test(line)) { const items: string[] = []; while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*[-*]\s+/, "")); blocks.push(<ul key={`u${i}`}>{items.map((item,j)=><li key={j}>{inline(item,`u${i}-${j}`)}</li>)}</ul>); continue; }

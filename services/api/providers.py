@@ -53,14 +53,54 @@ async def hybrid_search(db, bot_id, query):
 async def export_trace(trace_id, bot_id, input_text, output_text, metadata):
     public, secret = os.getenv('LANGFUSE_PUBLIC_KEY'), os.getenv('LANGFUSE_SECRET_KEY')
     if not public or not secret: return
-    timestamp = datetime.now(timezone.utc).isoformat()
-    trace = {'id': trace_id, 'name':'agentforge.chat', 'timestamp':timestamp, 'input':input_text, 'output':output_text, 'metadata':metadata, 'tags':['agentforge',bot_id]}
-    start = (datetime.now(timezone.utc)-timedelta(milliseconds=metadata.get('latency_ms',0))).isoformat()
-    generation = {'id':str(uuid.uuid4()),'traceId':trace_id,'name':'answer','startTime':start,'endTime':timestamp,'model':metadata.get('model'),'input':input_text,'output':output_text,'metadata':metadata,'usageDetails':{'total':metadata.get('tokens',0)},'costDetails':{'total':metadata.get('cost_cents',0)/100}}
-    batch = [{'id':str(uuid.uuid4()),'timestamp':timestamp,'type':'trace-create','body':trace},{'id':str(uuid.uuid4()),'timestamp':timestamp,'type':'generation-create','body':generation}]
+    # Langfuse Cloud's legacy /api/public/ingestion endpoint has been sunset.
+    # Use OTLP/HTTP JSON and the v4 ingestion header instead.
+    now = datetime.now(timezone.utc)
+    try: latency_ms = max(0, float(metadata.get('latency_ms') or 0))
+    except (TypeError, ValueError): latency_ms = 0
+    start = now - timedelta(milliseconds=latency_ms)
+    trace_hex = str(trace_id).replace('-', '').lower()
+    if len(trace_hex) != 32 or any(c not in '0123456789abcdef' for c in trace_hex):
+        trace_hex = uuid.uuid5(uuid.NAMESPACE_URL, str(trace_id)).hex
+    root_span_id = uuid.uuid4().hex[:16]
+
+    def attr(key, value):
+        if isinstance(value, bool): typed = {'boolValue': value}
+        elif isinstance(value, int): typed = {'intValue': str(value)}
+        elif isinstance(value, float): typed = {'doubleValue': value}
+        elif isinstance(value, list): typed = {'arrayValue': {'values': [{'stringValue': str(item)} for item in value]}}
+        else: typed = {'stringValue': str(value)}
+        return {'key': key, 'value': typed}
+
+    def span(span_id, name, span_start, span_end, attrs):
+        result = {'traceId': trace_hex, 'spanId': span_id,
+                  'name': name, 'kind': 1,
+                  'startTimeUnixNano': str(int(span_start.timestamp() * 1_000_000_000)),
+                  'endTimeUnixNano': str(int(span_end.timestamp() * 1_000_000_000)),
+                  'attributes': [attr(key, value) for key, value in attrs.items()]}
+        return result
+
+    common = {
+        'langfuse.trace.name': 'agentforge.chat',
+        'langfuse.trace.tags': ['agentforge', bot_id],
+        'langfuse.trace.metadata.bot_id': bot_id,
+    }
+    generation_attrs = {**common,
+        'langfuse.observation.type': 'generation',
+        'langfuse.observation.input': json.dumps(input_text, ensure_ascii=False),
+        'langfuse.observation.output': json.dumps(output_text, ensure_ascii=False),
+        'langfuse.observation.model.name': metadata.get('model') or 'unknown',
+        'langfuse.observation.usage_details': json.dumps({'total': metadata.get('tokens', 0)}),
+        'langfuse.observation.cost_details': json.dumps({'total': float(metadata.get('cost_cents') or 0) / 100}),
+        'langfuse.observation.metadata.confidence': metadata.get('confidence', 0),
+        'langfuse.observation.metadata.abstained': metadata.get('abstained', False),
+    }
+    payload = {'resourceSpans': [{'scopeSpans': [{'spans': [
+        span(root_span_id, 'agentforge.chat', start, now, generation_attrs),
+    ]}]}]}
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.post(os.getenv('LANGFUSE_HOST','https://cloud.langfuse.com').rstrip('/')+'/api/public/ingestion', auth=(public,secret), json={'batch':batch})
+            response = await client.post(os.getenv('LANGFUSE_HOST','https://cloud.langfuse.com').rstrip('/')+'/api/public/otel/v1/traces', auth=(public,secret), headers={'x-langfuse-ingestion-version':'4'}, json=payload)
             response.raise_for_status()
     except httpx.HTTPError:
         log.warning('Langfuse trace export failed; local trace remains available.')

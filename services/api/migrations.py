@@ -1,6 +1,6 @@
 """Versioned initial schema and additive upgrades for local databases."""
 from sqlalchemy import inspect, text
-from .database import engine, Base, Session, Bot, AgentVersion
+from .database import engine, Base, Session, Bot, AgentVersion, AppSetting, DocumentationCategory, DocumentationPage, now
 
 def migrate():
     with engine.begin() as connection:
@@ -23,6 +23,16 @@ def migrate():
         if 'is_active' not in user_columns: connection.execute(text('ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1'))
         if 'razorpay_subscription_id' not in user_columns: connection.execute(text('ALTER TABLE users ADD COLUMN razorpay_subscription_id VARCHAR'))
         if 'billing_provider' not in user_columns: connection.execute(text("ALTER TABLE users ADD COLUMN billing_provider VARCHAR NOT NULL DEFAULT 'stripe'"))
+        for field, kind, default in [('free_started_at','VARCHAR','NULL'),('free_trial_used','INTEGER','0'),('topup_tokens','INTEGER','0'),('subscription_tokens','INTEGER','0')]:
+            if field not in user_columns: connection.execute(text(f'ALTER TABLE users ADD COLUMN {field} {kind} NOT NULL DEFAULT {default}' if default != 'NULL' else f'ALTER TABLE users ADD COLUMN {field} {kind}'))
+        payment_columns={c['name'] for c in inspect(connection).get_columns('payments')}
+        if 'kind' not in payment_columns: connection.execute(text("ALTER TABLE payments ADD COLUMN kind VARCHAR NOT NULL DEFAULT 'subscription'"))
+        if 'tokens' not in payment_columns: connection.execute(text('ALTER TABLE payments ADD COLUMN tokens INTEGER'))
+        token_usage_columns={c['name'] for c in inspect(connection).get_columns('token_usage')}
+        if 'subscription_tokens' not in token_usage_columns: connection.execute(text('ALTER TABLE token_usage ADD COLUMN subscription_tokens INTEGER NOT NULL DEFAULT 0'))
+        if 'topup_tokens' not in token_usage_columns: connection.execute(text('ALTER TABLE token_usage ADD COLUMN topup_tokens INTEGER NOT NULL DEFAULT 0'))
+        connection.execute(text("UPDATE users SET free_started_at = created_at, free_trial_used = 1 WHERE free_started_at IS NULL AND free_trial_used = 0"))
+        connection.execute(text("UPDATE users SET subscription_tokens = CASE plan WHEN 'pro' THEN 10000000 WHEN 'team' THEN 50000000 ELSE 100000 END WHERE subscription_tokens = 0"))
         conversation_columns={c['name'] for c in inspect(connection).get_columns('conversations')}
         if 'workflow_state' not in conversation_columns:
             connection.execute(text("ALTER TABLE conversations ADD COLUMN workflow_state JSON DEFAULT '{}'"))
@@ -47,7 +57,18 @@ def migrate():
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (7) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (8) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (9) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (10) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (11) ON CONFLICT (version) DO NOTHING'))
     with Session() as db:
+        if not db.get(AppSetting, 'documentation_seed_v1'):
+            from .documentation_content import DEFAULT_DOCUMENTATION
+            for section in DEFAULT_DOCUMENTATION:
+                category = DocumentationCategory(title=section['title'], slug=section['slug'], description=section['description'], position=section['position'])
+                db.add(category)
+                db.flush()
+                for page in section['pages']:
+                    db.add(DocumentationPage(category_id=category.id, title=page['title'], slug=page['slug'], summary=page['summary'], content=page['content'], status='published', position=page['position']))
+            db.add(AppSetting(key='documentation_seed_v1', value='seeded', updated_at=now()))
         for bot in db.query(Bot).all():
             widget = dict(bot.widget_config or {})
             for key, value in {'color':'#d6ff63','position':'right','greeting':'Hi! What can I help you find?','logo':'','launcher_icon':'sparkle'}.items(): widget.setdefault(key,value)
@@ -59,4 +80,4 @@ def migrate():
 
 if __name__ == '__main__':
     migrate()
-    print('AgentForge schema version 9 applied.')
+    print('AgentForge schema version 10 applied.')

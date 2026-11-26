@@ -1,0 +1,17 @@
+.langfuse-setup{margin:0 0 16px;padding-left:22px;color:#4c566a;font-size:11px;line-height:2.2}
+.langfuse-setup code{padding:2px 5px;border-radius:4px;background:#f3f4f6;font-size:10px}
+.trace-io{max-width:260px;min-width:180px;white-space:normal;overflow-wrap:anywhere;line-height:1.6}
+.trace-io summary{cursor:pointer;color:#4c566a}
+.trace-io pre{max-width:500px;max-height:300px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:10px/1.6 ui-monospace,monospace}
+.langfuse-range-panel{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;margin-bottom:14px}
+.langfuse-range-panel h2,.langfuse-breakdown .panel-heading h2{font-size:14px}
+.langfuse-range-panel p,.langfuse-breakdown .panel-heading p{font-size:10px;color:var(--muted);margin-top:5px}
+.langfuse-range-controls{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap}
+.langfuse-range-controls label{display:grid;gap:5px;color:#737d8f;font-size:9px;font-weight:700}
+.langfuse-range-controls input{border:1px solid #e3e6eb;border-radius:7px;background:#fff;padding:8px;font-size:10px;color:#313b50}
+.langfuse-range-controls button{padding:8px 10px;font-size:9px}
+.langfuse-metrics-caption{font-size:10px;color:#8992a2;margin:0 2px 10px}
+.langfuse-metrics-grid{margin-bottom:15px}
+.langfuse-breakdown{margin-bottom:15px}
+.langfuse-breakdown .panel-heading{padding:18px 20px 0}
+@media(max-width:1050px){.langfuse-range-panel{align-items:flex-start;flex-direction:column}.langfuse-range-controls{width:100%}}

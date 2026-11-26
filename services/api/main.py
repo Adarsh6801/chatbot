@@ -15,8 +15,9 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
-from .config import WEB_ORIGIN, PUBLIC_WEB_URL, PRODUCTION, PLANS
-from .database import Base, engine, Session, get_db, User, LoginSession, Bot, AgentVersion, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, WorkflowApiLog, BotActivityLog, AppSetting, now
+from .config import WEB_ORIGIN, PUBLIC_WEB_URL, PRODUCTION
+from .database import Base, engine, Session, get_db, User, LoginSession, Bot, AgentVersion, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, WorkflowApiLog, BotActivityLog, AppSetting, TokenUsage, now
+from .chat_templates import get_templates, resolve_agent_theme, normalize_customization
 from .security import current_user, owned_bot, password_hash, verify_password, digest, rate_limit
 from .ingestion import ingest, parse_file, eval_bot, MAX_BYTES
 from .rag import retrieve, rerank, generate, generate_stream, INJECTION
@@ -49,11 +50,14 @@ from .workflow import router as workflow_router, record_api_log, record_bot_log
 app.include_router(workflow_router)
 from .admin import router as admin_router
 app.include_router(admin_router)
+from .documentation import router as documentation_router
+app.include_router(documentation_router)
 from .support import router as support_router
 app.include_router(support_router)
 from .billing import router as billing_router
 app.include_router(billing_router)
 from .payment_settings import get_payment_provider, payment_provider_status
+from .plan_catalog import get_plan_limits, get_plan_catalog, get_plan
 ADMIN_WEB_ORIGIN = os.getenv('ADMIN_WEB_ORIGIN', 'http://localhost:3001')
 TRUSTED_WEB_ORIGINS = [WEB_ORIGIN, ADMIN_WEB_ORIGIN]
 app.add_middleware(CORSMiddleware, allow_origins=TRUSTED_WEB_ORIGINS, allow_credentials=True, allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], allow_headers=['Content-Type', 'Authorization', 'X-AgentForge-Client'])
@@ -131,7 +135,9 @@ class BotUpdate(BaseModel):
         if logo and not logo.startswith('https://') and not (bucket and logo.startswith(f's3://{bucket}/agent-assets/')): raise ValueError('Logo must use HTTPS or be uploaded to this workspace S3 bucket.')
         launcher_icon = value.get('launcher_icon', 'sparkle')
         if launcher_icon not in ('sparkle', 'message', 'chat', 'headset'): raise ValueError('Choose a supported chat launcher icon.')
-        return {'color': color, 'position': value.get('position', 'right'), 'greeting': greeting, 'logo': logo, 'launcher_icon': launcher_icon}
+        template_id = str(value.get('chat_template_id') or 'classic')[:80]
+        customization = normalize_customization(value.get('chat_customization') or {})
+        return {'color': color, 'position': value.get('position', 'right'), 'greeting': greeting, 'logo': logo, 'launcher_icon': launcher_icon, 'chat_template_id':template_id, 'chat_customization':customization}
 
 class SourceInput(BaseModel):
     name: str = Field(default='Knowledge note', min_length=1, max_length=200)
@@ -180,7 +186,7 @@ def has_active_subscription(user):
 
 def bot_snapshot(bot):
     widget = dict(bot.widget_config or {})
-    for key, value in {'color':'#d6ff63','position':'right','greeting':'Hi! What can I help you find?','logo':'','launcher_icon':'sparkle'}.items(): widget.setdefault(key,value)
+    for key, value in {'color':'#d6ff63','position':'right','greeting':'Hi! What can I help you find?','logo':'','launcher_icon':'sparkle','chat_template_id':'classic','chat_customization':{}}.items(): widget.setdefault(key,value)
     return {'name': bot.name, 'description': bot.description or '', 'system_prompt': bot.system_prompt or '', 'threshold': bot.threshold, 'widget_config': widget}
 
 def bot_data(bot, db):
@@ -205,8 +211,15 @@ def set_session(response, db, user):
 
 def check_document_quota(db, user, extra=1):
     db.execute(update(User).where(User.id == user.id).values(plan=User.plan))
+    if user.plan == 'free' and user.free_started_at:
+        try:
+            started = datetime.fromisoformat(user.free_started_at.replace('Z', '+00:00'))
+            if (datetime.now(timezone.utc) - started).days >= 30:
+                raise HTTPException(403, 'Your Free plan has ended. Choose a paid plan or contact an administrator.')
+        except ValueError:
+            pass
     total = db.query(Document).join(Bot, Document.bot_id == Bot.id).filter(Bot.user_id == user.id).count()
-    if total + extra > PLANS[user.plan]['documents']: raise HTTPException(403, 'Document limit reached. Upgrade your plan to add more sources.')
+    if total + extra > get_plan_limits(db, user.plan)['documents']: raise HTTPException(403, 'Document limit reached. Upgrade your plan to add more sources.')
 
 @app.get('/health')
 def health(): return {'status': 'ok', 'generation': 'openai' if os.getenv('OPENAI_API_KEY') else 'local-extractive'}
@@ -223,7 +236,9 @@ def demo_pricing():
 @app.post('/api/v1/auth/register', status_code=201)
 def register(body: AuthInput, request: Request, response: Response, db: DBSession = Depends(get_db)):
     rate_limit(db, 'register:' + (request.client.host if request.client else 'unknown'), 10, 3600)
-    user = User(email=body.email, name=body.name.strip(), password=password_hash(body.password))
+    free_enabled = get_plan(db, 'free') is not None
+    free_started_at = now() if free_enabled else (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    user = User(email=body.email, name=body.name.strip(), password=password_hash(body.password), free_started_at=free_started_at, free_trial_used=1, subscription_tokens=get_plan_limits(db, 'free')['tokens'] if free_enabled else 0)
     db.add(user)
     try: db.commit()
     except IntegrityError:
@@ -265,7 +280,14 @@ def list_bots(db: DBSession = Depends(get_db), user=Depends(current_user)):
 @app.post('/api/v1/bots', status_code=201)
 def create_bot(body: BotInput, db: DBSession = Depends(get_db), user=Depends(current_user)):
     db.execute(update(User).where(User.id == user.id).values(plan=User.plan))
-    if db.query(Bot).filter_by(user_id=user.id).count() >= PLANS[user.plan]['bots']: raise HTTPException(403, 'Agent limit reached. Upgrade your plan to create more agents.')
+    if user.plan == 'free' and user.free_started_at:
+        try:
+            started = datetime.fromisoformat(user.free_started_at.replace('Z', '+00:00'))
+            if (datetime.now(timezone.utc) - started).days >= 30:
+                raise HTTPException(403, 'Your Free plan has ended. Choose a paid plan or contact an administrator.')
+        except ValueError:
+            pass
+    if db.query(Bot).filter_by(user_id=user.id).count() >= get_plan_limits(db, user.plan)['bots']: raise HTTPException(403, 'Agent limit reached. Upgrade your plan to create more agents.')
     slug = (re.sub(r'[^a-z0-9]+', '-', body.name.lower()).strip('-') or 'agent') + '-' + secrets.token_hex(3)
     bot = Bot(user_id=user.id, name=body.name.strip(), description=body.description, slug=slug)
     db.add(bot)
@@ -292,6 +314,12 @@ def update_bot(bot_id: str, body: BotUpdate, db: DBSession = Depends(get_db), us
     updates=body.model_dump(exclude_unset=True)
     publish_requested = updates.pop('published', None)
     requested_logo = (updates.get('widget_config') or {}).get('logo', '')
+    requested_template = (updates.get('widget_config') or {}).get('chat_template_id')
+    if requested_template:
+        template = next((row for row in get_templates(db) if row.get('id') == requested_template and row.get('active', True)), None)
+        current_template = (bot.widget_config or {}).get('chat_template_id') or 'classic'
+        if not template and requested_template != current_template:
+            raise HTTPException(422, 'Choose an available chat template.')
     if requested_logo.startswith('s3://') and not requested_logo.startswith(f"s3://{os.getenv('S3_BUCKET', '')}/agent-assets/{bot.id}/logos/"):
         raise HTTPException(422, 'Uploaded logo must belong to this agent.')
     for key, value in updates.items():
@@ -465,17 +493,23 @@ def retrain(bot_id: str, tasks: BackgroundTasks, db: DBSession = Depends(get_db)
     return {'queued': len(docs)}
 
 @app.get('/api/v1/public/bots/{slug}')
-def public_bot(slug: str, request: Request, db: DBSession = Depends(get_db)):
+def public_bot(slug: str, request: Request, response: Response, db: DBSession = Depends(get_db)):
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     bot = db.query(Bot).filter_by(slug=slug, published=1).first()
     if not bot: raise HTTPException(404, 'This agent is not published.')
     runtime = public_agent_config(bot)
-    return {'name':runtime['name'],'description':runtime['description'],'public_key':bot.public_key,'widget_config':public_widget_config(bot, request)}
+    return {'name':runtime['name'],'description':runtime['description'],'public_key':bot.public_key,'widget_config':public_widget_config(bot, request, db)}
+
+@app.get('/api/v1/chat-templates')
+def available_chat_templates(db: DBSession = Depends(get_db), _user=Depends(current_user)):
+    return {'templates':[{'id':row['id'],'name':row['name'],'description':row.get('description',''),'active':bool(row.get('active',True)),'config':row['config']} for row in get_templates(db)]}
 
 @app.get('/api/v1/public/widget/{key}')
-def widget_config(key: str, request: Request, db: DBSession = Depends(get_db)):
+def widget_config(key: str, request: Request, response: Response, db: DBSession = Depends(get_db)):
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     bot = db.query(Bot).filter_by(public_key=key, published=1).first()
     if not bot: raise HTTPException(404, 'This agent is not published.')
-    return {'name': public_agent_config(bot)['name'], 'chat_url': PUBLIC_WEB_URL + '/chat/' + bot.slug, 'widget_config': public_widget_config(bot, request)}
+    return {'name': public_agent_config(bot)['name'], 'chat_url': PUBLIC_WEB_URL + '/chat/' + bot.slug, 'widget_config': public_widget_config(bot, request, db)}
 
 @app.get('/api/v1/public/site-settings')
 def public_site_settings(request: Request, db: DBSession = Depends(get_db)):
@@ -499,8 +533,10 @@ def public_site_logo(db: DBSession = Depends(get_db)):
     if content_type != 'image/png': raise HTTPException(404,'Site logo not found.')
     return Response(content,media_type='image/png',headers={'Cache-Control':'public, max-age=3600','X-Content-Type-Options':'nosniff'})
 
-def public_widget_config(bot, request):
+def public_widget_config(bot, request, db):
     config = dict(public_agent_config(bot).get('widget_config') or {})
+    theme, _template = resolve_agent_theme(db, config)
+    config['chat_theme'] = theme
     if str(config.get('logo', '')).startswith('s3://'):
         config['logo'] = str(request.base_url).rstrip('/') + f'/api/v1/public/bots/{bot.public_key}/logo'
     return config
@@ -581,11 +617,15 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
             pass
     rate_limit(db, f'chat:{key}:{request.client.host if request.client else "unknown"}', 30)
     user = db.get(User, bot.user_id)
-    month = datetime.now(timezone.utc).strftime('%Y-%m')
-    # Serialize quota accounting for a tenant on Postgres; SQLite serializes writers.
-    db.execute(update(User).where(User.id == user.id).values(plan=User.plan))
-    count = db.query(Message).join(Bot, Message.bot_id == Bot.id).filter(Bot.user_id == user.id, Message.role == 'user', Message.created_at.startswith(month)).count()
-    if count >= PLANS[user.plan]['messages']: raise HTTPException(429, 'This agent has reached its monthly message limit.')
+    if user.plan == 'free' and user.free_started_at:
+        try:
+            started = datetime.fromisoformat(user.free_started_at.replace('Z', '+00:00'))
+            if (datetime.now(timezone.utc) - started).days >= 30:
+                raise HTTPException(403, 'Your 30-day Free plan has ended. Choose a paid plan or contact an administrator.')
+        except ValueError:
+            pass
+    if user.subscription_tokens <= 0 and user.topup_tokens <= 0:
+        raise HTTPException(429, 'No token credits remain. Add a top-up or renew your subscription.')
     conversation = None
     if body.conversation_id:
         identity_match = or_(Conversation.visitor_id == body.visitor_id, Conversation.user_id == body.user_id) if body.user_id else Conversation.visitor_id == body.visitor_id
@@ -599,7 +639,8 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
         conversation.user_id = body.user_id or conversation.user_id
         conversation.user_name = body.user_name or conversation.user_name
     history = db.query(Message).filter_by(conversation_id=conversation.id).order_by(Message.created_at.desc()).limit(40).all()[::-1]
-    db.add(Message(conversation_id=conversation.id, bot_id=bot.id, role='user', content=body.message))
+    user_message = Message(conversation_id=conversation.id, bot_id=bot.id, role='user', content=body.message)
+    db.add(user_message)
     db.commit()
     record_bot_log(db,bot.id,'chat',conversation.id,{'event_type':'message_received','severity':'info','title':'Visitor message received','details':{'message_length':len(body.message),'workflow_enabled':bool(db.query(Workflow).filter_by(bot_id=bot.id,enabled=1).first())}})
     start = time.perf_counter()
@@ -663,8 +704,17 @@ async def chat(key: str, body: ChatInput, request: Request, db: DBSession = Depe
                     else: model,tokens,cost = data['model'],data['tokens'],data['cost']
             latency = int((time.perf_counter() - start) * 1000)
             with Session() as store:
+                store_user = store.get(User, user.id)
                 stored = Message(bot_id=bot_id, conversation_id=conv_id, role='assistant', content=answer, citations=citations, confidence=confidence, tokens=tokens, cost_cents=cost, latency_ms=latency, trace={'model': model, 'abstained': abstain, 'blocked': blocked,'workflow':workflow_result['trace'] if workflow_result else [], 'retrieval': [{'chunk_id': h['chunk'].id, 'bm25': h['bm25'], 'cosine': h['cosine'], 'confidence': h['confidence']} for h in hits]})
                 store.add(stored)
+                store.flush()
+                remaining = max(0, int(tokens or 0))
+                from_subscription = min(store_user.subscription_tokens, remaining)
+                store_user.subscription_tokens -= from_subscription
+                from_topup = remaining - from_subscription
+                store_user.topup_tokens = max(0, store_user.topup_tokens - from_topup)
+                if remaining:
+                    store.add(TokenUsage(user_id=user.id, message_id=stored.id, tokens=remaining, subscription_tokens=from_subscription, topup_tokens=from_topup, source='subscription' if from_topup == 0 else 'topup' if from_subscription == 0 else 'subscription+topup'))
                 from .rag import words
                 evidence_words = set(words(' '.join(h['chunk'].content for h in hits)))
                 answer_words = set(words(answer))
@@ -759,7 +809,19 @@ def usage(db: DBSession = Depends(get_db), user=Depends(current_user)):
     selected_provider = get_payment_provider(db)
     user_has_subscription = bool(user.plan != 'free' and ((user.billing_provider == 'stripe' and user.stripe_customer_id and user.subscription_id) or (user.billing_provider == 'razorpay' and user.razorpay_subscription_id)))
     billing_provider = ('razorpay' if user.razorpay_subscription_id else 'stripe') if (user.razorpay_subscription_id or user.subscription_id) else selected_provider
-    return {'plan': user.plan, 'limits': PLANS[user.plan], 'bots': db.query(Bot).filter_by(user_id=user.id).count(), 'documents': db.query(Document).join(Bot).filter(Bot.user_id == user.id).count(), 'messages': db.query(Message).join(Bot).filter(Bot.user_id == user.id, Message.role == 'user', Message.created_at.startswith(month)).count(), 'billing_configured': payment_provider_status()[selected_provider]['configured'], 'has_subscription': user_has_subscription, 'has_pending_subscription': bool(user.razorpay_subscription_id or user.subscription_id), 'payment_provider': billing_provider}
+    from .billing import _public_plan
+    limits = get_plan_limits(db, user.plan)
+    free_eligible = user.plan != 'free' or not user.free_started_at
+    if user.plan == 'free' and user.free_started_at:
+        try: free_eligible = (datetime.now(timezone.utc) - datetime.fromisoformat(user.free_started_at.replace('Z', '+00:00'))).days < 30
+        except ValueError: free_eligible = True
+    if user.plan == 'free' and not free_eligible: limits = {'bots':0,'documents':0,'tokens':0}
+    return {'plan': user.plan, 'display_plan': user.plan if free_eligible else 'none', 'limits': limits, 'plans': [_public_plan(p, selected_provider) for p in get_plan_catalog(db) if p.get('active', True)], 'bots': db.query(Bot).filter_by(user_id=user.id).count(), 'documents': db.query(Document).join(Bot).filter(Bot.user_id == user.id).count(), 'messages': db.query(Message).join(Bot).filter(Bot.user_id == user.id, Message.role == 'user', Message.created_at.startswith(month)).count(), 'billing_configured': payment_provider_status(db)[selected_provider]['configured'], 'has_subscription': user_has_subscription, 'has_pending_subscription': bool(user.razorpay_subscription_id or user.subscription_id), 'payment_provider': billing_provider, 'checkout_provider': selected_provider, 'subscription_tokens': user.subscription_tokens, 'topup_tokens': user.topup_tokens, 'free_started_at': user.free_started_at}
+
+@app.get('/api/v1/account/token-usage')
+def token_usage(db: DBSession = Depends(get_db), user=Depends(current_user)):
+    rows = db.query(TokenUsage).filter_by(user_id=user.id).order_by(TokenUsage.created_at.desc()).limit(100).all()
+    return {'items': [{'tokens': row.tokens, 'subscription_tokens': row.subscription_tokens, 'topup_tokens': row.topup_tokens, 'source': row.source, 'created_at': row.created_at} for row in rows]}
 
 @app.get('/api/v1/account/keys')
 def keys(db: DBSession = Depends(get_db), user=Depends(current_user)):

@@ -50,6 +50,7 @@ import AccountProfile, { UserProfile } from "@/components/AccountProfile";
 import { useDialogs } from "@/components/Dialogs";
 import AuthGate from "@/components/AuthGate";
 import "@/components/account.css";
+import "@/components/billing-polish.css";
 import { api, API, Bot } from "@/lib/api";
 import "@/components/workspace-polish.css";
 import "@/components/support.css";
@@ -86,7 +87,8 @@ const sectionPaths: Record<Section, string> = {
   agents: "/agents", analytics: "/analytics", conversations: "/conversations",
   billing: "/plans", keys: "/api-keys", profile: "/profile", support: "/support",
 };
-const demoText = `AgentForge helps teams build support agents grounded in their own documents. You can upload PDF, DOCX, text, and Markdown files or import a public website page. Each answer includes citations so visitors can check its evidence.\n\nThe Free plan includes 1 agent, 10 documents, and 100 messages per month. The Pro plan includes 10 agents, 100 documents, and 5,000 messages per month. The Team plan includes 50 agents, 500 documents, and 25,000 messages per month.\n\nTo install your agent on a website, publish it from the Deploy tab, copy the embed script, and paste it before the closing body tag. You can also share the hosted chat link. Customize the greeting, accent color, and widget position from Settings.\n\nIf an agent cannot find an answer in its documents, it says it does not know and flags the question. Open Improve, write a verified answer, and save it to train the agent on the missing information.\n\nFor help, contact your AgentForge workspace administrator. Documents remain scoped to their agent and owner. The local demo uses extractive answers and does not send your documents to an AI provider unless an OpenAI API key is configured.`;
+const demoText = `AgentForge helps teams build support agents grounded in their own documents. You can upload PDF, DOCX, text, and Markdown files or import a public website page. Each answer includes citations so visitors can check its evidence.\n\nThe Free plan includes 1 agent, 10 documents, and 100,000 tokens for 30 days. The Pro plan includes 10 agents, 100 documents, and 10 million tokens per billing period. The Team plan includes 50 agents, 500 documents, and 50 million tokens per billing period.\n\nTo install your agent on a website, publish it from the Deploy tab, copy the embed script, and paste it before the closing body tag. You can also share the hosted chat link. Customize the greeting, accent color, and widget position from Settings.\n\nIf an agent cannot find an answer in its documents, it says it does not know and flags the question. Open Improve, write a verified answer, and save it to train the agent on the missing information.\n\nFor help, contact your AgentForge workspace administrator. Documents remain scoped to their agent and owner. The local demo uses extractive answers and does not send your documents to an AI provider unless an OpenAI API key is configured.`;
+const defaultChatTheme = {layout:'classic',accent_color:'#d6ff63',surface_color:'#ffffff',text_color:'#252b25',muted_color:'#858b80',header_subtitle:'Grounded in your knowledge',welcome_title:'Your answers start here.',suggested_prompt:'What can you help me with?',footer_text:'Answers include source evidence',corner_radius:16,show_header:true,show_avatar:true,show_header_subtitle:true,show_new_chat:true,show_welcome:true,show_welcome_icon:true,show_suggestion:true,show_citations:true,show_footer:true};
 
 export default function Dashboard({ onAuthenticationChange }: { onAuthenticationChange?: (signedIn: boolean) => void }) {
   const pathname = usePathname();
@@ -242,8 +244,17 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
         const checkoutSessionId = params.get("checkout_session_id");
         setToast("Checkout returned. Checking subscription status…");
         void api("/billing/status", { method: "POST", body: JSON.stringify({ checkout_session_id: checkoutSessionId }) })
-          .then((status: any) => setToast(status.status === "active" ? `Subscription active. Your ${status.plan} plan is ready.` : "Payment is still processing. Your plan will update when the provider confirms it."))
+          .then(async (status: any) => { if(status.kind==='topup'){await refresh();setToast('Top-up payment confirmed. Token credits added.');}else if(status.status==='active'){await refresh();setToast(`Subscription active. Your ${status.plan} plan is ready.`);}else if(status.status==='failed'||status.status==='cancelled'){setToast('Subscription checkout was not completed. You can retry from the plan list.');}else setToast("Payment is still processing. Your plan will update when the provider confirms it."); })
           .catch(() => setToast("Payment is still processing. Your plan will update when the provider confirms it."));
+      } else if (result === 'razorpay_topup_return') {
+        const paymentLinkId=params.get('razorpay_payment_link_id');
+        setToast('Verifying your top-up payment with Razorpay…');
+        if(paymentLinkId) void api('/billing/topups/status',{method:'POST',body:JSON.stringify({payment_link_id:paymentLinkId})}).then(async(status:any)=>{await refresh();if(status.status==='paid'){setToast('Top-up payment confirmed. Token credits added.');}else if(status.status==='failed'||status.status==='cancelled'){setToast('Top-up payment was not completed. No tokens were added.');}else setToast('Payment is still processing. We will add tokens after Razorpay confirms it.');}).catch(()=>setToast('Could not verify this top-up yet. Open Usage & billing and check the payment status shortly.'));
+        else setToast('Razorpay did not return a payment reference. Check your top-up history shortly.');
+      } else if(result==='cancelled') {
+        const attemptId=params.get('attempt_id');
+        if(attemptId) void api('/billing/status',{method:'POST',body:JSON.stringify({attempt_id:attemptId,cancelled:true})}).then(()=>setToast('Checkout cancelled. No subscription access was added.')).catch(()=>setToast('Checkout cancelled. No subscription access was added.'));
+        else setToast("Checkout cancelled. Your current plan is unchanged.");
       } else {
         setToast("Checkout cancelled. Your current plan is unchanged.");
       }
@@ -336,7 +347,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                 {user.plan.charAt(0).toUpperCase() + user.plan.slice(1)} plan
               </strong>
               <span>
-                {usage?.messages || 0} / {usage?.limits.messages || 100}
+                {(Number(usage?.subscription_tokens||0)+Number(usage?.topup_tokens||0)).toLocaleString()} tokens
               </span>
             </div>
             <div className="meter">
@@ -345,14 +356,14 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                   width:
                     Math.min(
                       100,
-                      ((usage?.messages || 0) /
-                        (usage?.limits.messages || 100)) *
+                      ((Number(usage?.subscription_tokens||0)+Number(usage?.topup_tokens||0)) /
+                        (usage?.limits.tokens || 1)) *
                         100,
                     ) + "%",
                 }}
               />
             </div>
-            <p>Monthly messages used</p>
+            <p>Subscription and top-up credits available</p>
             <button
               onClick={() => navigateSection("billing")}
             >
@@ -738,6 +749,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
           ) : section === "profile" ? (
             <AccountProfile
               user={user}
+              usage={usage}
               onUpdate={setUser}
               onSubscribe={() => navigateSection("billing")}
               onLogout={logout}
@@ -926,6 +938,9 @@ function AgentDetail({
   const [logoUploading, setLogoUploading] = useState(false);
   const [logoUploadError, setLogoUploadError] = useState("");
   const [widgetPreview, setWidgetPreview] = useState(() => ({name:bot.name, greeting:bot.widget_config.greeting, color:bot.widget_config.color, position:bot.widget_config.position, launcherIcon:bot.widget_config.launcher_icon || "sparkle"}));
+  const [chatTemplates,setChatTemplates]=useState<any[]>([]);
+  const [chatTemplateId,setChatTemplateId]=useState(bot.widget_config.chat_template_id||'classic');
+  const [chatCustomization,setChatCustomization]=useState<any>(bot.widget_config.chat_customization||{});
   const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
   const [agentVersions, setAgentVersions] = useState<any[]>([]);
   const [selectedVersionId, setSelectedVersionId] = useState("");
@@ -936,6 +951,11 @@ function AgentDetail({
     [mode, setMode] = useState("upload"),
     [loadError, setLoadError] = useState("");
   const base = "/bots/" + bot.id;
+  useEffect(()=>{let mounted=true;api<any>('/chat-templates').then(data=>{if(mounted)setChatTemplates(data.templates||[])}).catch(()=>{});return()=>{mounted=false}},[bot.id]);
+  useEffect(()=>{setChatTemplateId(bot.widget_config.chat_template_id||'classic');setChatCustomization(bot.widget_config.chat_customization||{})},[bot.id]);
+  const selectedChatTemplate=chatTemplates.find(template=>template.id===chatTemplateId);
+  const currentChatTheme:any={...defaultChatTheme,...(selectedChatTemplate?.config||{}),...chatCustomization};
+  const setChatThemeField=(key:string,value:any)=>setChatCustomization((current:any)=>({...current,[key]:value}));
   async function load() {
     const path =
       tab === "Knowledge"
@@ -1025,6 +1045,10 @@ function AgentDetail({
         setAgentVersions(result.items || []);setSelectedVersionId(result.items?.[0]?.id || "");
       }
     },bot.published?"Published a new major version.":"Your agent is live.");
+  }
+  async function saveShareableTemplate() {
+    const widget_config={color:bot.widget_config.color,greeting:bot.widget_config.greeting,position:bot.widget_config.position,logo:logoUrlInput.trim()||logoRef,launcher_icon:bot.widget_config.launcher_icon||"sparkle",chat_template_id:chatTemplateId,chat_customization:chatCustomization};
+    await action(() => api(base, {method:"PATCH", body:JSON.stringify({widget_config,...(bot.published?{published:true}:{})})}), bot.published?"Shareable chat appearance saved and published.":"Shareable chat appearance saved. Publish the agent to make its link live.");
   }
   async function restoreMajorVersion(version: any) {
     if (version.kind !== "major") return;
@@ -1523,6 +1547,14 @@ function AgentDetail({
           </div>
         </div>
       </div>
+      <section className="panel shareable-template-studio">
+        <div className="shareable-studio-heading"><div><span className="eyebrow">SHAREABLE CHAT LINK</span><h2>Choose and customize its appearance</h2><p>Preview the hosted chat, choose a starting template, and customize its components for this agent.</p></div><span className={bot.published?"shareable-live":"shareable-draft"}>{bot.published?"Published link":"Draft preview"}</span></div>
+        <div className="shareable-studio-grid">
+          <section className="shareable-template-choices"><div className="shareable-subheading"><h3>Templates</h3><span>{chatTemplates.filter(template=>template.active!==false||template.id===chatTemplateId).length} available</span></div><div className="shareable-template-choice-list">{chatTemplates.filter(template=>template.active!==false||template.id===chatTemplateId).map(template=><button type="button" key={template.id} className={chatTemplateId===template.id?"selected":""} onClick={()=>{if(template.active===false&&template.id!==chatTemplateId)return;setChatTemplateId(template.id);setChatCustomization({});}}><span className="shareable-template-swatch" style={{background:template.config?.accent_color||"#d6ff63"}}/><span><strong>{template.name}</strong><small>{template.description||"Chat experience template"}</small></span><i>{chatTemplateId===template.id?"Selected":"Use template"}</i></button>)}</div></section>
+          <section className="shareable-template-controls"><div className="shareable-subheading"><h3>Customize components</h3><span>Per-agent settings</span></div><div className="shareable-control-grid"><label>Layout<select value={currentChatTheme.layout} onChange={event=>setChatThemeField("layout",event.target.value)}>{(["classic","minimal","studio","helpdesk","knowledge","concierge","boutique","bold","editorial","compact","night"]).map(layout=><option key={layout} value={layout}>{layout[0].toUpperCase()+layout.slice(1)}</option>)}</select></label>{([['accent_color','Accent'],['surface_color','Background'],['text_color','Text'],['muted_color','Muted text']] as [string,string][]).map(([key,label])=><label key={key}>{label}<input type="color" value={currentChatTheme[key]} onChange={event=>setChatThemeField(key,event.target.value)}/></label>)}{([['header_subtitle','Header subtitle'],['welcome_title','Welcome headline'],['suggested_prompt','Quick reply'],['footer_text','Footer text']] as [string,string][]).map(([key,label])=><label className="wide" key={key}>{label}<input maxLength={key==='suggested_prompt'?180:120} value={currentChatTheme[key]} onChange={event=>setChatThemeField(key,event.target.value)}/></label>)}</div><div className="shareable-control-toggles">{([['show_header','Header'],['show_avatar','Avatar'],['show_header_subtitle','Subtitle'],['show_new_chat','New chat'],['show_welcome','Welcome'],['show_welcome_icon','Welcome icon'],['show_suggestion','Quick reply'],['show_citations','Citations'],['show_footer','Footer']] as [string,string][]).map(([key,label])=><label key={key}><input type="checkbox" checked={currentChatTheme[key]} onChange={event=>setChatThemeField(key,event.target.checked)}/>{label}</label>)}</div><button type="button" className="primary shareable-save-button" onClick={()=>void saveShareableTemplate()} disabled={busy}>{bot.published?"Save and publish":"Save appearance"} <Check size={14}/></button><small className="shareable-publish-note">{bot.published?"Saving publishes this appearance to the live shareable link.":"Saved as a draft. Publish the agent to make its link live."}</small></section>
+          <section className="shareable-template-preview"><div className="shareable-subheading"><div><h3>Live preview</h3><span>{link}</span></div>{bot.published&&<a href={link} target="_blank" rel="noreferrer">Open link <ExternalLink size={12}/></a>}</div><div className={`shareable-chat-stage hosted-chat hosted-${currentChatTheme.layout||"classic"}`}><Chat preview publicView publicKey={bot.public_key} name={bot.name} greeting={bot.widget_config.greeting} color={bot.widget_config.color} logo={logoPreview} theme={currentChatTheme}/></div></section>
+        </div>
+      </section>
       {versionHistoryOpen && bot.version_history_enabled && <section className="panel agent-version-panel"><div className="section-heading"><div><h2>Agent versions</h2><p>Major versions are published releases. Minor versions are saved drafts.</p></div></div>{versionLoading ? <p className="version-state">Loading versions…</p> : versionError ? <div className="error" role="alert">{versionError}</div> : !agentVersions.length ? <p className="version-state">No saved versions yet.</p> : <><label>Choose a version<select value={selectedVersionId} onChange={event=>setSelectedVersionId(event.target.value)}>{agentVersions.map(version=><option key={version.id} value={version.id}>v{version.version} · {version.kind === "major" ? "Published" : "Draft"} · {new Date(version.created_at).toLocaleString()}</option>)}</select></label>{(()=>{const version=agentVersions.find(item=>item.id===selectedVersionId);if(!version)return null;return <div className="agent-version-details"><div><strong>Version {version.version}</strong><span className={version.kind}>{version.kind === "major" ? "Published major version" : "Saved minor draft"}</span><time>{new Date(version.created_at).toLocaleString()}</time></div><pre>{JSON.stringify(version.snapshot,null,2)}</pre>{version.kind === "major"&&<button className="secondary" disabled={busy} onClick={()=>void restoreMajorVersion(version)}><RefreshCw size={14}/>Restore and publish this version</button>}</div>;})()}</>}</section>}
       </>
     );
@@ -1549,6 +1581,8 @@ function AgentDetail({
                     position: form.get("position"),
                     logo: logoUrlInput.trim() || logoRef,
                     launcher_icon: form.get("launcher_icon"),
+                    chat_template_id: chatTemplateId,
+                    chat_customization: chatCustomization,
                   },
                 }),
               }),
@@ -1826,14 +1860,26 @@ function Billing({
   refresh: () => Promise<void>;
   notify: (message: string) => void;
 }) {
+  const [topupData, setTopupData] = useState<any>({packages:[],transactions:[],usage:[]});
+  const [billingLoading, setBillingLoading] = useState(true);
+  const loadBilling = async () => { try { setTopupData(await api('/billing/topups')); } catch {} finally { setBillingLoading(false); } };
+  useEffect(() => { let mounted=true; setBillingLoading(true); api('/billing/topups').then(data=>{if(mounted)setTopupData(data);}).catch(()=>{}).finally(()=>{if(mounted)setBillingLoading(false);}); return ()=>{mounted=false;}; }, [usage?.plan, usage?.payment_provider]);
+  const periodDate = (timestamp?: number | null) => timestamp ? new Date(timestamp * 1000).toLocaleDateString(undefined,{year:'numeric',month:'long',day:'numeric'}) : 'Not available';
   async function checkSubscriptionStatus() {
     try {
       const status: any = await api("/billing/status", { method: "POST", body: JSON.stringify({}) });
       if (status.status === "active" || status.status === "authenticated") {
         await refresh();
+        await loadBilling();
         notify(`Razorpay subscription confirmed. Your ${status.plan} plan is ready.`);
+      } else if(status.payment_status==='failed'||status.status==='failed'||status.status==='cancelled'||status.status==='halted') {
+        await refresh();
+        await loadBilling();
+        notify('Razorpay did not complete this payment. You can retry the checkout.');
+      } else if(status.payment_status==='abandoned') {
+        notify('Checkout was closed before confirmation. Choose the plan again to reopen the same Razorpay checkout.');
       } else {
-        notify("Razorpay has not marked this subscription active yet. Check again in a few seconds.");
+        notify("Razorpay is still waiting for payment authorization. Check again in a few seconds.");
       }
     } catch {
       notify("Could not check Razorpay right now. Please try again.");
@@ -1841,33 +1887,35 @@ function Billing({
   }
   return (
     <>
-      <div className="page-heading">
+      <div className="page-heading billing-heading">
         <div>
+          <div className="eyebrow">ACCOUNT FINANCES</div>
           <h1>Room to grow.</h1>
           <p>
-            A plan for your next chapter. Current plan: {usage?.plan || "free"}. Checkout: {usage?.payment_provider || "Stripe"}.
+            Review your plan, remaining credits, billing dates, and payment history.
           </p>
         </div>
-        <button
-          className="secondary"
-          disabled={!usage?.has_subscription || busy}
-          onClick={() =>
-            action(async () => {
-              const d = await api("/billing/portal", { method: "POST" });
-              if (d.url) window.location.assign(d.url);
-            }, usage?.payment_provider === "razorpay" ? "Cancellation scheduled for the end of the billing cycle." : undefined)
-          }
-        >
-          {usage?.payment_provider === "razorpay" ? "Cancel at renewal" : "Manage subscription"} <ExternalLink size={14} />
-        </button>
+        <button className="secondary" disabled={billingLoading} onClick={() => void loadBilling()}><RefreshCw size={14}/> Refresh billing</button>
+        {usage?.payment_provider === 'stripe' && <button className="secondary" disabled={!usage?.has_subscription || busy} onClick={() => action(async () => { const d=await api('/billing/portal',{method:'POST'}); if(d.url)window.location.assign(d.url); },'Opening Stripe billing settings…')}>Payment settings <ExternalLink size={14}/></button>}
+        {usage?.has_subscription && <button className="secondary" disabled={busy || (usage?.payment_provider==='razorpay' && topupData.subscription?.cancel_at_period_end)} title={usage?.payment_provider==='razorpay' && topupData.subscription?.cancel_at_period_end ? 'Razorpay does not support reversing a scheduled cancellation.' : undefined} onClick={() => action(async () => { const cancelAtPeriodEnd=!topupData.subscription?.cancel_at_period_end; await api('/billing/subscription/cancellation',{method:'POST',body:JSON.stringify({cancel_at_period_end:cancelAtPeriodEnd})}); await refresh(); await loadBilling(); }, topupData.subscription?.cancel_at_period_end ? 'Subscription renewal restored.' : 'Subscription will remain active through the paid period and then end.')}>{topupData.subscription?.cancel_at_period_end ? (usage?.payment_provider==='stripe'?'Keep subscription':'Cancellation scheduled') : 'Cancel at period end'} {topupData.subscription?.cancel_at_period_end ? <Check size={14}/> : <X size={14}/>}</button>}
         {usage?.payment_provider === "razorpay" && usage?.has_pending_subscription && (
           <button className="secondary" disabled={busy} onClick={() => void checkSubscriptionStatus()}>
             Check subscription status <RefreshCw size={14} />
           </button>
         )}
       </div>
+      <section className="billing-overview">
+        <article className="billing-summary-card current-plan-card"><span className="billing-card-label">CURRENT PLAN</span><strong>{String(usage?.display_plan ?? usage?.plan ?? 'free').toUpperCase()}</strong><span className={`billing-status-pill ${topupData.subscription?.status === 'active' || topupData.subscription?.status === 'authenticated' ? 'is-active' : ''}`}>{topupData.subscription?.status || (usage?.display_plan==='none'?'No plan assigned':usage?.plan === 'free' ? 'Free plan' : 'Checking status')}</span></article>
+        <article className="billing-summary-card"><span className="billing-card-label">SUBSCRIPTION CREDITS</span><strong>{Number(usage?.subscription_tokens ?? 0).toLocaleString()}</strong><small>remaining · {Number(usage?.limits?.tokens ?? 0).toLocaleString()} per period</small></article>
+        <article className="billing-summary-card"><span className="billing-card-label">TOP-UP CREDITS</span><strong>{Number(usage?.topup_tokens ?? 0).toLocaleString()}</strong><small>available after subscription credits</small></article>
+        <article className="billing-summary-card"><span className="billing-card-label">NEXT BILLING</span><strong className="billing-date-value">{topupData.subscription?.next_billing_at ? periodDate(topupData.subscription.next_billing_at) : '—'}</strong><small>{topupData.subscription?.renews ? `Renews with ${topupData.subscription?.provider || usage?.payment_provider}` : 'No renewal scheduled'}</small></article>
+        <article className="billing-summary-card"><span className="billing-card-label">CURRENT PERIOD ENDS</span><strong className="billing-date-value">{topupData.subscription?.current_period_end ? periodDate(topupData.subscription.current_period_end) : '—'}</strong><small>{topupData.subscription?.cancel_at_period_end ? 'Cancellation scheduled' : topupData.subscription?.details_available ? 'Provider confirmed' : 'Provider date unavailable'}</small></article>
+      </section>
+      <p className="billing-status-note">{topupData.subscription?.details_available ? `Billing status confirmed by ${topupData.subscription.provider}.` : 'Billing dates appear when the payment provider returns them. Your balances and usage remain available in the meantime.'}</p>
+      <div className="billing-detail-line"><span>Provider <strong>{topupData.subscription?.provider || usage?.payment_provider || '—'}</strong></span><span>Period started <strong>{topupData.subscription?.current_period_start ? periodDate(topupData.subscription.current_period_start) : '—'}</strong></span><span>Renewal <strong>{topupData.subscription?.renews ? 'Automatic' : 'Not scheduled'}</strong></span><span>Cancellation <strong>{topupData.subscription?.cancel_at ? `Scheduled · ${periodDate(topupData.subscription.cancel_at)}` : topupData.subscription?.cancel_at_period_end ? 'At period end' : 'Not scheduled'}</strong></span></div>
+      <div className="billing-page-section"><h2>Plans</h2><p>Compare workspace limits and choose the plan that fits your usage.</p></div>
       <div className="plan-grid">
-        {[
+        {(usage?.plans?.length ? usage.plans : [
           { name: "Free", price: "$0", bots: 1, docs: 10, messages: "100" },
           {
             name: "Pro",
@@ -1883,14 +1931,14 @@ function Billing({
             docs: 500,
             messages: "25,000",
           },
-        ].map((p, i) => (
+        ]).map((p:any, i:number) => (
           <div
             className={"panel pricing " + (i === 1 ? "featured" : "")}
-            key={p.name}
+            key={p.slug || p.name}
           >
             {i === 1 && <span className="badge">FOR GROWING TEAMS</span>}
             <h2>{p.name}</h2>
-            <strong>{p.price}</strong>
+            <strong>{p.slug === 'free' || p.name === 'Free' ? 'Free' : (p[usage?.checkout_provider === 'razorpay' ? 'razorpay_amount' : 'stripe_amount'] != null ? `${p[usage?.checkout_provider === 'razorpay' ? 'razorpay_currency' : 'stripe_currency'] || ''} ${p[usage?.checkout_provider === 'razorpay' ? 'razorpay_amount' : 'stripe_amount']}` : 'Monthly plan')}</strong>
             <p>
               {i === 0
                 ? "Start building for free."
@@ -1903,11 +1951,11 @@ function Billing({
               </li>
               <li>
                 <Check size={15} />
-                {p.docs} knowledge sources
+                {p.documents ?? p.docs} knowledge sources
               </li>
               <li>
                 <Check size={15} />
-                {p.messages} messages per month
+                {Number(p.tokens||0).toLocaleString()} tokens per billing period
               </li>
               <li>
                 <Check size={15} />
@@ -1918,8 +1966,9 @@ function Billing({
               className={i === 1 ? "primary full" : "secondary full"}
               disabled={
                 busy ||
-                usage?.plan === p.name.toLowerCase() ||
-                i === 0 ||
+                usage?.plan === (p.slug || p.name.toLowerCase()) ||
+                (p.slug || p.name.toLowerCase()) === 'free' ||
+                p.checkout_available === false ||
                 !usage?.billing_configured
               }
               onClick={() =>
@@ -1928,7 +1977,7 @@ function Billing({
                   if (!checkoutWindow) throw new Error("Allow pop-ups for this site to open Razorpay checkout in a separate tab.");
                   const d = await api("/billing/checkout", {
                     method: "POST",
-                    body: JSON.stringify({ plan: p.name.toLowerCase() }),
+                    body: JSON.stringify({ plan: p.slug || p.name.toLowerCase() }),
                   });
                   if (d.already_active) {
                     checkoutWindow.close();
@@ -1940,7 +1989,7 @@ function Billing({
                     throw new Error("Razorpay did not return a checkout link for this subscription update.");
                   }
                   checkoutWindow.location.assign(d.url);
-                  if (usage?.payment_provider === "razorpay") {
+                  if (usage?.checkout_provider === "razorpay") {
                     notify("Razorpay checkout opened in a new tab. Keep this page open while we check the subscription.");
                     void (async () => {
                       for (let attempt = 0; attempt < 36; attempt += 1) {
@@ -1952,6 +2001,13 @@ function Billing({
                             notify(`Razorpay subscription confirmed. Your ${status.plan} plan is ready.`);
                             return;
                           }
+                          if(status.status==='failed'||status.status==='cancelled'||status.status==='halted'){
+                            await refresh();notify('Razorpay payment failed or expired. Select the plan to start another checkout.');return;
+                          }
+                          if(checkoutWindow.closed&&status.status==='created'){
+                            await api('/billing/status',{method:'POST',body:JSON.stringify({abandoned:true})});
+                            notify('Checkout closed before payment confirmation. Select the plan again to reopen the same Razorpay checkout.');return;
+                          }
                         } catch { /* Keep checking while Razorpay finishes authorization. */ }
                       }
                       notify("Still waiting for Razorpay to activate the subscription. Use Check subscription status to retry.");
@@ -1960,15 +2016,25 @@ function Billing({
                 })
               }
             >
-              {usage?.plan === p.name.toLowerCase()
+              {usage?.plan === (p.slug || p.name.toLowerCase())
                 ? "Current plan"
-                : i === 0
+                : (p.slug || p.name.toLowerCase()) === 'free'
                   ? "Included"
                   : "Subscribe to " + p.name}
             </button>
           </div>
         ))}
       </div>
+      <p className="muted">Free includes {Number(usage?.limits?.tokens||100000).toLocaleString()} tokens for 30 days, once per account. Subscription token allowances renew with subscription payments.</p>
+      <section className="panel usage-panel billing-page-section">
+        <h3>Token credits</h3>
+        <p>Subscription credits are used first, followed by your top-up balance.</p>
+        <div className="token-balances"><strong>Subscription: {Number(topupData.subscription_tokens ?? usage?.subscription_tokens ?? 0).toLocaleString()}</strong><strong>Top-up: {Number(topupData.topup_tokens ?? usage?.topup_tokens ?? 0).toLocaleString()}</strong></div>
+        <h3>Buy top-up credits</h3><p>One-time token packs added to your balance after payment confirmation.</p>
+        <div className="topup-packages">{topupData.packages.map((pkg:any)=><article className="panel" key={pkg.id}><strong>{pkg.name}</strong><p>{Number(pkg.tokens).toLocaleString()} tokens · ₹{pkg.amount}</p><button className="primary" disabled={busy||!usage?.billing_configured} onClick={()=>void action(async()=>{const checkoutWindow=usage?.checkout_provider==='razorpay'?window.open('about:blank','_blank'):null;if(usage?.checkout_provider==='razorpay'&&!checkoutWindow)throw new Error('Allow pop-ups for this site to open Razorpay checkout.');try{const checkout=await api('/billing/topups/checkout',{method:'POST',body:JSON.stringify({package_id:pkg.id})});if(!checkout.url){checkoutWindow?.close();throw new Error('The payment provider did not return a checkout link.');}if(checkout.provider==='razorpay'&&checkout.payment_link_id&&checkoutWindow){checkoutWindow.location.assign(checkout.url);notify('Razorpay top-up opened. Credits will be added after payment is confirmed.');void (async()=>{for(let attempt=0;attempt<36;attempt++){await new Promise(resolve=>window.setTimeout(resolve,5000));try{const status:any=await api('/billing/topups/status',{method:'POST',body:JSON.stringify({payment_link_id:checkout.payment_link_id})});if(status.status==='paid'){await refresh();await loadBilling();notify('Top-up payment confirmed. Token credits added.');return;}if(status.status==='failed'||status.status==='cancelled'){await loadBilling();notify('Top-up payment did not complete. No tokens were added.');return;}if(checkoutWindow.closed){notify('Checkout closed before confirmation. Check the payment status in your top-up history shortly.');return;}}catch{/* Retry provider verification while checkout is open. */}}notify('Payment is still processing. Refresh billing to check the latest status.');})();}else window.location.assign(checkout.url);}catch(error){checkoutWindow?.close();throw error;}},'Opening secure checkout…')}>Top up</button></article>)}</div>
+        <h3>Top-up payments</h3><div className="table-scroll"><table><thead><tr><th>DATE</th><th>TOKENS</th><th>AMOUNT</th><th>PROVIDER</th><th>STATUS</th><th></th></tr></thead><tbody>{topupData.transactions.map((p:any)=><tr key={p.id}><td>{new Date(p.created_at).toLocaleString()}</td><td>{Number(p.tokens||0).toLocaleString()}</td><td>{p.amount==null?'—':`${(p.amount/100).toFixed(2)} ${(p.currency||'').toUpperCase()}`}</td><td>{p.provider}</td><td>{p.status}</td><td>{p.provider==='razorpay'&&p.payment_link_id&&p.status==='pending'&&<button className="secondary" onClick={()=>void (async()=>{try{const status:any=await api('/billing/topups/status',{method:'POST',body:JSON.stringify({payment_link_id:p.payment_link_id})});await refresh();await loadBilling();notify(status.status==='paid'?'Top-up confirmed. Token credits added.':status.status==='pending'?'Razorpay has not confirmed this payment yet.':'Top-up payment did not complete.');}catch{notify('Could not check this payment. Try again shortly.');}})()}>Check status</button>}</td></tr>)}</tbody></table>{!topupData.transactions.length&&<p>No top-up payments yet.</p>}</div>
+        <h3>Token usage</h3><div className="table-scroll"><table><thead><tr><th>DATE</th><th>USED</th><th>SUBSCRIPTION</th><th>TOP-UP</th></tr></thead><tbody>{topupData.usage.map((u:any,i:number)=><tr key={`${u.created_at}-${i}`}><td>{new Date(u.created_at).toLocaleString()}</td><td>{Number(u.tokens).toLocaleString()}</td><td>{Number(u.subscription_tokens||0).toLocaleString()}</td><td>{Number(u.topup_tokens||0).toLocaleString()}</td></tr>)}</tbody></table>{!topupData.usage.length&&<p>No token usage yet.</p>}</div>
+      </section>
       {!usage?.billing_configured && (
         <p className="muted">
           Plan upgrades need{" "}
@@ -1979,8 +2045,8 @@ function Billing({
         </p>
       )}
       <div className="panel usage-panel">
-        <h3>This month&apos;s usage</h3>
-        {["bots", "documents", "messages"].map((k) => (
+        <h3>Workspace limits</h3>
+        {["bots", "documents"].map((k) => (
           <div key={k}>
             <span>{k[0].toUpperCase() + k.slice(1)}</span>
             <strong>
@@ -1999,6 +2065,12 @@ function Billing({
             </div>
           </div>
         ))}
+        <div className="workspace-token-limit">
+          <div><span>Subscription tokens</span><strong>{Number(usage?.subscription_tokens ?? 0).toLocaleString()} available <small>of {Number(usage?.limits?.tokens ?? 0).toLocaleString()}</small></strong></div>
+          <div className="meter"><i style={{width: `${Math.min(100, Number(usage?.limits?.tokens) ? Number(usage?.subscription_tokens ?? 0) / Number(usage?.limits?.tokens) * 100 : 0)}%`}} /></div>
+          <p>Used first for requests. Top-up balance is used after these credits run out.</p>
+        </div>
+        <div className="workspace-token-limit"><div><span>Top-up tokens</span><strong>{Number(usage?.topup_tokens ?? 0).toLocaleString()} available</strong></div></div>
       </div>
     </>
   );
@@ -2027,6 +2099,7 @@ function Keys({
             passwords.
           </p>
         </div>
+        <a className="secondary" href="/api-docs">API documentation <ExternalLink size={14}/></a>
       </div>
       <form
         className="panel key-form"

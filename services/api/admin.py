@@ -1,16 +1,20 @@
 """Global platform administration endpoints, isolated from workspace APIs."""
-import os, json, struct, asyncio
+import os, json, struct, asyncio, re
 
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Request, Response, Query
 from pydantic import BaseModel, Field, field_validator
+from typing import Literal
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
+import httpx
+from datetime import datetime, timedelta, timezone
 
-from .config import PLANS
-from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, Bot, Conversation, Document, LoginSession, Message, Payment, SupportTicket, SupportTicketMessage, User, get_db, now
+from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, Bot, Conversation, Document, DocumentationCategory, DocumentationPage, LoginSession, Message, Payment, SupportTicket, SupportTicketMessage, User, get_db, now, uid
 from .payment_settings import get_payment_provider, payment_provider_status
 from .security import current_user
 from .providers import store_site_logo, read_site_logo
+from .plan_catalog import get_plan_catalog
+from .chat_templates import get_templates, write_templates, normalize_theme, template_data
 
 router = APIRouter(prefix="/api/v1/admin", tags=["platform administration"])
 
@@ -38,6 +42,78 @@ class AgentUpdate(BaseModel):
 class PaymentProviderUpdate(BaseModel):
     provider: str
 
+class TopupPackageWrite(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    amount: int = Field(gt=0, le=100000000)
+    tokens: int = Field(gt=0, le=10000000000)
+
+class TopupPackagesUpdate(BaseModel):
+    packages: list[TopupPackageWrite]
+
+class ChatTemplateWrite(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default='', max_length=300)
+    active: bool = True
+    config: dict
+
+    @field_validator('name')
+    @classmethod
+    def trim_template_text(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError('Template name cannot be blank.')
+        return value
+
+    @field_validator('description')
+    @classmethod
+    def trim_template_description(cls, value):
+        return value.strip()
+
+    @field_validator('config')
+    @classmethod
+    def clean_template_config(cls, value):
+        return normalize_theme(value)
+
+class PlanCatalogEntry(BaseModel):
+    slug: str = Field(pattern=r'^[a-z][a-z0-9_-]{1,39}$')
+    name: str = Field(min_length=1, max_length=80)
+    active: bool = True
+    bots: int = Field(ge=0, le=100000)
+    documents: int = Field(ge=0, le=1000000)
+    tokens: int = Field(ge=0, le=100000000000)
+    stripe_price_id: str = Field(default='', max_length=200)
+    stripe_product_id: str = Field(default='', max_length=200)
+    stripe_interval: Literal['month','year'] = 'month'
+    stripe_interval_count: int = Field(default=1, ge=1, le=12)
+    stripe_amount: float | None = Field(default=None, ge=0)
+    stripe_currency: str = Field(default='USD', min_length=3, max_length=3)
+    razorpay_plan_id: str = Field(default='', max_length=200)
+    razorpay_interval: Literal['month','year'] = 'month'
+    razorpay_interval_count: int = Field(default=1, ge=1, le=12)
+    razorpay_amount: float | None = Field(default=None, ge=0)
+    razorpay_currency: str = Field(default='INR', min_length=3, max_length=3)
+
+class PlanCatalogUpdate(BaseModel):
+    plans: list[PlanCatalogEntry]
+
+class FreePlanUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    active: bool = True
+    bots: int = Field(ge=0, le=100000)
+    documents: int = Field(ge=0, le=1000000)
+    tokens: int = Field(ge=0, le=100000000000)
+
+class ProviderPlanCreate(BaseModel):
+    slug: str = Field(pattern=r'^[a-z][a-z0-9_-]{1,39}$')
+    name: str = Field(min_length=1, max_length=80)
+    amount: float = Field(gt=0, le=100000000)
+    currency: str = Field(default='INR', min_length=3, max_length=3)
+    interval: Literal['month','year'] = 'month'
+    interval_count: int = Field(default=1, ge=1, le=12)
+    bots: int = Field(ge=0, le=100000)
+    documents: int = Field(ge=0, le=1000000)
+    tokens: int = Field(gt=0, le=100000000000)
+
 
 class SiteSettingsUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
@@ -58,9 +134,49 @@ class SupportStatusUpdate(BaseModel):
     status: str
 
 
+class DocumentationCategoryWrite(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+    slug: str = Field(min_length=1, max_length=120)
+    description: str = Field(default='', max_length=500)
+    position: int = Field(default=0, ge=0, le=10000)
+
+    @field_validator('title', 'slug', 'description')
+    @classmethod
+    def trim_documentation_category(cls, value):
+        return value.strip()
+
+
+class DocumentationPageWrite(BaseModel):
+    category_id: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=160)
+    slug: str = Field(min_length=1, max_length=180)
+    summary: str = Field(default='', max_length=500)
+    content: str = Field(min_length=1, max_length=100000)
+    status: Literal['draft', 'published'] = 'draft'
+    position: int = Field(default=0, ge=0, le=10000)
+
+    @field_validator('title', 'slug', 'summary')
+    @classmethod
+    def trim_documentation_page(cls, value):
+        return value.strip()
+
+    @field_validator('content')
+    @classmethod
+    def validate_documentation_content(cls, value):
+        if not value.strip(): raise ValueError('Article content cannot be blank.')
+        return value.strip()
+
+
+def normalize_docs_slug(value: str) -> str:
+    slug = re.sub(r'[^a-z0-9]+', '-', value.lower()).strip('-')
+    if not slug or len(slug) > 180:
+        raise HTTPException(422, 'Enter a valid URL slug using letters and numbers.')
+    return slug
+
+
 @router.get("/overview")
 def overview(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
-    provider_status = payment_provider_status()
+    provider_status = payment_provider_status(db)
     return {
         "users": db.query(func.count(User.id)).scalar() or 0,
         "active_users": db.query(func.count(User.id)).filter(User.is_active == 1).scalar() or 0,
@@ -80,9 +196,198 @@ def overview(db: Session = Depends(get_db), _admin: User = Depends(require_admin
     }
 
 
+@router.get('/langfuse/observations')
+async def langfuse_observations(cursor: str | None = None, limit: int = Query(50, ge=1, le=100), _admin: User = Depends(require_admin)):
+    public, secret = os.getenv('LANGFUSE_PUBLIC_KEY'), os.getenv('LANGFUSE_SECRET_KEY')
+    if not public or not secret:
+        return {'configured': False, 'items': [], 'cursor': None}
+    from datetime import datetime, timedelta, timezone
+    now_utc = datetime.now(timezone.utc)
+    params = {
+        'fromStartTime': (now_utc - timedelta(days=90)).isoformat(),
+        'toStartTime': now_utc.isoformat(),
+        'isRootObservation': 'true',
+        'fields': 'core,basic,io,metadata,model,usage,metrics,trace_context',
+        'limit': limit,
+    }
+    if cursor: params['cursor'] = cursor
+    url = os.getenv('LANGFUSE_HOST', 'https://cloud.langfuse.com').rstrip('/') + '/api/public/v2/observations'
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(url, params=params, auth=(public, secret))
+            response.raise_for_status()
+        body = response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            raise HTTPException(502, 'Langfuse rejected the configured API keys. Check the project keys and read access.')
+        raise HTTPException(502, f'Langfuse API returned HTTP {exc.response.status_code}.')
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(502, 'Could not read observations from Langfuse. Check the host and network connection.')
+    return {'configured': True, 'items': body.get('data', []), 'cursor': (body.get('meta') or {}).get('cursor')}
+
+
+@router.get('/langfuse/metrics')
+async def langfuse_metrics(from_timestamp: datetime, to_timestamp: datetime, _admin: User = Depends(require_admin)):
+    public, secret = os.getenv('LANGFUSE_PUBLIC_KEY'), os.getenv('LANGFUSE_SECRET_KEY')
+    if not public or not secret:
+        return {'configured': False, 'summary': {}, 'by_model': [], 'daily': []}
+    if from_timestamp.tzinfo is None or to_timestamp.tzinfo is None:
+        raise HTTPException(422, 'Choose a date range with timezone-aware timestamps.')
+    start = from_timestamp.astimezone(timezone.utc)
+    end = to_timestamp.astimezone(timezone.utc)
+    if start > end:
+        raise HTTPException(422, 'Start date must be on or before the end date.')
+    if end - start > timedelta(days=366):
+        raise HTTPException(422, 'Choose a date range of 366 days or less.')
+
+    root_filter = [{'column': 'isRootObservation', 'operator': '=', 'value': True, 'type': 'boolean'}]
+    base = {'view': 'observations', 'filters': root_filter, 'fromTimestamp': start.isoformat(), 'toTimestamp': end.isoformat()}
+    summary_query = {**base, 'metrics': [
+        {'measure': 'count', 'aggregation': 'count'},
+        {'measure': 'totalTokens', 'aggregation': 'sum'},
+        {'measure': 'totalCost', 'aggregation': 'sum'},
+        {'measure': 'latency', 'aggregation': 'avg'},
+    ]}
+    model_query = {**base, 'metrics': [
+        {'measure': 'count', 'aggregation': 'count'},
+        {'measure': 'totalTokens', 'aggregation': 'sum'},
+        {'measure': 'totalCost', 'aggregation': 'sum'},
+    ], 'dimensions': [{'field': 'providedModelName'}], 'config': {'row_limit': 100}}
+    daily_query = {**base, 'metrics': [
+        {'measure': 'count', 'aggregation': 'count'},
+        {'measure': 'totalTokens', 'aggregation': 'sum'},
+        {'measure': 'totalCost', 'aggregation': 'sum'},
+    ], 'timeDimension': {'granularity': 'day'}, 'config': {'row_limit': 1000}}
+    url = os.getenv('LANGFUSE_HOST', 'https://cloud.langfuse.com').rstrip('/') + '/api/public/v2/metrics'
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            responses = await asyncio.gather(*[
+                client.get(url, params={'query': json.dumps(query)}, auth=(public, secret))
+                for query in (summary_query, model_query, daily_query)
+            ])
+            for response in responses: response.raise_for_status()
+        summary_rows, model_body, daily_body = [response.json() for response in responses]
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            raise HTTPException(502, 'Langfuse rejected the configured API keys. Check the project keys and read access.')
+        raise HTTPException(502, f'Langfuse Metrics API returned HTTP {exc.response.status_code}.')
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(502, 'Could not read metrics from Langfuse. Check the host and network connection.')
+
+    summary = (summary_rows.get('data') or [{}])[0]
+    return {
+        'configured': True,
+        'from_timestamp': start.isoformat(),
+        'to_timestamp': end.isoformat(),
+        'summary': {
+            'requests': summary.get('count_count', 0) or 0,
+            'total_tokens': summary.get('sum_totalTokens', 0) or 0,
+            'total_cost': summary.get('sum_totalCost', 0) or 0,
+            'avg_latency': summary.get('avg_latency', 0) or 0,
+        },
+        'by_model': model_body.get('data', []),
+        'daily': daily_body.get('data', []),
+    }
+
+
+def admin_doc_page(page: DocumentationPage) -> dict:
+    return {key: getattr(page, key) for key in ('id', 'category_id', 'title', 'slug', 'summary', 'content', 'status', 'position', 'created_at', 'updated_at')}
+
+
+@router.get('/documentation')
+def admin_documentation(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    categories = db.query(DocumentationCategory).order_by(DocumentationCategory.position, DocumentationCategory.title).all()
+    pages = db.query(DocumentationPage).order_by(DocumentationPage.position, DocumentationPage.title).all()
+    pages_by_category: dict[str, list[dict]] = {}
+    for page in pages: pages_by_category.setdefault(page.category_id, []).append(admin_doc_page(page))
+    return {'categories': [
+        {'id': category.id, 'title': category.title, 'slug': category.slug,
+         'description': category.description, 'position': category.position,
+         'created_at': category.created_at, 'updated_at': category.updated_at,
+         'pages': pages_by_category.get(category.id, [])}
+        for category in categories
+    ]}
+
+
+@router.post('/documentation/categories', status_code=201)
+def create_documentation_category(body: DocumentationCategoryWrite, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    if not body.title.strip(): raise HTTPException(422, 'Section title cannot be blank.')
+    slug = normalize_docs_slug(body.slug)
+    if db.query(DocumentationCategory).filter_by(slug=slug).first(): raise HTTPException(409, 'A documentation section with this slug already exists.')
+    category = DocumentationCategory(title=body.title.strip(), slug=slug, description=body.description.strip(), position=body.position)
+    db.add(category); db.flush()
+    write_audit(db, admin, 'documentation.category.created', 'documentation_category', category.id, {'title': category.title, 'slug': slug})
+    db.commit()
+    return {'id': category.id, 'title': category.title, 'slug': category.slug, 'description': category.description, 'position': category.position, 'pages': []}
+
+
+@router.put('/documentation/categories/{category_id}')
+def update_documentation_category(category_id: str, body: DocumentationCategoryWrite, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    category = db.get(DocumentationCategory, category_id)
+    if not category: raise HTTPException(404, 'Documentation section not found.')
+    if not body.title.strip(): raise HTTPException(422, 'Section title cannot be blank.')
+    slug = normalize_docs_slug(body.slug)
+    if db.query(DocumentationCategory).filter(DocumentationCategory.slug == slug, DocumentationCategory.id != category_id).first(): raise HTTPException(409, 'A documentation section with this slug already exists.')
+    changes = {'title': category.title != body.title.strip(), 'slug': category.slug != slug}
+    category.title, category.slug, category.description, category.position, category.updated_at = body.title.strip(), slug, body.description.strip(), body.position, now()
+    write_audit(db, admin, 'documentation.category.updated', 'documentation_category', category.id, changes)
+    db.commit()
+    return {'id': category.id, 'title': category.title, 'slug': category.slug, 'description': category.description, 'position': category.position}
+
+
+@router.delete('/documentation/categories/{category_id}')
+def delete_documentation_category(category_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    category = db.get(DocumentationCategory, category_id)
+    if not category: raise HTTPException(404, 'Documentation section not found.')
+    page_count = db.query(DocumentationPage).filter_by(category_id=category.id).count()
+    db.query(DocumentationPage).filter_by(category_id=category.id).delete(synchronize_session=False)
+    db.delete(category)
+    write_audit(db, admin, 'documentation.category.deleted', 'documentation_category', category.id, {'title': category.title, 'pages_deleted': page_count})
+    db.commit()
+    return {'ok': True, 'deleted_pages': page_count}
+
+
+@router.post('/documentation/pages', status_code=201)
+def create_documentation_page(body: DocumentationPageWrite, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    if not db.get(DocumentationCategory, body.category_id): raise HTTPException(422, 'Choose an existing documentation section.')
+    if not body.title.strip(): raise HTTPException(422, 'Page title cannot be blank.')
+    slug = normalize_docs_slug(body.slug)
+    if db.query(DocumentationPage).filter_by(slug=slug).first(): raise HTTPException(409, 'A documentation page with this slug already exists.')
+    page = DocumentationPage(category_id=body.category_id, title=body.title.strip(), slug=slug, summary=body.summary.strip(), content=body.content, status=body.status, position=body.position)
+    db.add(page); db.flush()
+    write_audit(db, admin, 'documentation.page.created', 'documentation_page', page.id, {'title': page.title, 'slug': slug, 'status': page.status})
+    db.commit()
+    return admin_doc_page(page)
+
+
+@router.put('/documentation/pages/{page_id}')
+def update_documentation_page(page_id: str, body: DocumentationPageWrite, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    page = db.get(DocumentationPage, page_id)
+    if not page: raise HTTPException(404, 'Documentation page not found.')
+    if not body.title.strip(): raise HTTPException(422, 'Page title cannot be blank.')
+    if not db.get(DocumentationCategory, body.category_id): raise HTTPException(422, 'Choose an existing documentation section.')
+    slug = normalize_docs_slug(body.slug)
+    if db.query(DocumentationPage).filter(DocumentationPage.slug == slug, DocumentationPage.id != page_id).first(): raise HTTPException(409, 'A documentation page with this slug already exists.')
+    changes = {'title': page.title != body.title.strip(), 'slug': page.slug != slug, 'status': page.status != body.status, 'category_id': page.category_id != body.category_id}
+    page.category_id, page.title, page.slug = body.category_id, body.title.strip(), slug
+    page.summary, page.content, page.status, page.position, page.updated_at = body.summary.strip(), body.content, body.status, body.position, now()
+    write_audit(db, admin, 'documentation.page.updated', 'documentation_page', page.id, changes)
+    db.commit()
+    return admin_doc_page(page)
+
+
+@router.delete('/documentation/pages/{page_id}')
+def delete_documentation_page(page_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    page = db.get(DocumentationPage, page_id)
+    if not page: raise HTTPException(404, 'Documentation page not found.')
+    write_audit(db, admin, 'documentation.page.deleted', 'documentation_page', page.id, {'title': page.title, 'slug': page.slug})
+    db.delete(page); db.commit()
+    return {'ok': True}
+
+
 @router.get("/settings/payment-provider")
 def get_payment_settings(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
-    return {"provider": get_payment_provider(db), "providers": payment_provider_status()}
+    return {"provider": get_payment_provider(db), "providers": payment_provider_status(db)}
 
 
 @router.get("/payments")
@@ -91,10 +396,198 @@ def payments(page: int = 1, limit: int = 25, db: Session = Depends(get_db), _adm
     query = db.query(Payment, User).join(User, Payment.user_id == User.id)
     total = query.count()
     records = query.order_by(Payment.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
-    items = [{"id": payment.id, "provider": payment.provider, "status": payment.status, "plan": payment.plan,
+    items = [{"id": payment.id, "provider": payment.provider, "status": payment.status, "plan": payment.plan, "kind": payment.kind, "tokens": payment.tokens,
               "amount": payment.amount, "currency": payment.currency, "created_at": payment.created_at,
               "user_name": user.name, "user_email": user.email} for payment, user in records]
     return {"items": items, "total": total, "page": page, "limit": limit}
+
+def _topup_catalog(db):
+    setting = db.get(AppSetting, 'topup_packages')
+    try: return json.loads(setting.value) if setting else []
+    except (ValueError, TypeError): return []
+
+@router.get('/topups')
+def topups(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    rows = db.query(Payment, User).join(User, Payment.user_id == User.id).filter(Payment.kind == 'topup').order_by(Payment.created_at.desc()).limit(250).all()
+    revenue = db.query(func.coalesce(func.sum(Payment.amount), 0)).filter(Payment.kind == 'topup', Payment.status.in_(['paid','captured'])).scalar() or 0
+    return {'packages': _topup_catalog(db), 'transactions': [{'id': p.id, 'user_id': p.user_id, 'user_name': u.name, 'user_email': u.email, 'provider': p.provider, 'status': p.status, 'amount': p.amount, 'currency': p.currency, 'tokens': p.tokens, 'created_at': p.created_at} for p,u in rows], 'revenue': revenue}
+
+@router.get('/plans')
+def admin_plans(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    return {'plans': get_plan_catalog(db)}
+
+@router.get('/chat-templates')
+def list_chat_templates(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    return {'templates':[template_data(row) for row in get_templates(db)]}
+
+@router.post('/chat-templates', status_code=201)
+def create_chat_template(body: ChatTemplateWrite, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    template = {'id':uid(),'name':body.name,'description':body.description,'active':body.active,'config':body.config}
+    templates = get_templates(db)
+    templates.append(template)
+    write_templates(db, templates)
+    write_audit(db, admin, 'chat_template.created', 'chat_template', template['id'], {'name':template['name']})
+    db.commit()
+    return {'template':template_data(template)}
+
+@router.put('/chat-templates/{template_id}')
+def update_chat_template(template_id: str, body: ChatTemplateWrite, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    templates = get_templates(db)
+    template = next((row for row in templates if row.get('id') == template_id), None)
+    if not template: raise HTTPException(404, 'Chat template not found.')
+    before = template_data(template)
+    template.update({'name':body.name,'description':body.description,'active':body.active,'config':body.config})
+    write_templates(db, templates)
+    write_audit(db, admin, 'chat_template.updated', 'chat_template', template_id, {'before':before,'after':template_data(template)})
+    db.commit()
+    return {'template':template_data(template)}
+
+@router.delete('/chat-templates/{template_id}')
+def delete_chat_template(template_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    templates = get_templates(db)
+    template = next((row for row in templates if row.get('id') == template_id), None)
+    if not template: raise HTTPException(404, 'Chat template not found.')
+    templates = [row for row in templates if row.get('id') != template_id]
+    write_templates(db, templates)
+    write_audit(db, admin, 'chat_template.deleted', 'chat_template', template_id, {'name':template.get('name')})
+    db.commit()
+    return {'ok':True,'id':template_id}
+
+@router.get('/plans/free')
+def get_free_plan(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    plan = next((item for item in get_plan_catalog(db) if item.get('slug') == 'free'), None)
+    if not plan: raise HTTPException(404, 'Free plan configuration not found.')
+    return {'plan': plan}
+
+@router.put('/plans/free')
+def update_free_plan(body: FreePlanUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    plans = get_plan_catalog(db)
+    plan = next((item for item in plans if item.get('slug') == 'free'), None)
+    if not plan: raise HTTPException(404, 'Free plan configuration not found.')
+    before = {key: plan.get(key) for key in ('name', 'active', 'bots', 'documents', 'tokens')}
+    plan.update(body.model_dump())
+    _write_plan_catalog(db, plans)
+    write_audit(db, admin, 'plan.free_updated', 'plan', 'free', {'before': before, 'after': body.model_dump()})
+    db.commit()
+    return {'plan': plan}
+
+def _write_plan_catalog(db, plans):
+    setting = db.get(AppSetting, 'plan_catalog')
+    value = json.dumps(plans, separators=(',', ':'))
+    if setting: setting.value, setting.updated_at = value, now()
+    else: db.add(AppSetting(key='plan_catalog', value=value, updated_at=now()))
+
+@router.get('/plans/provider/{provider}')
+def list_provider_plans(provider: str, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    if provider not in ('stripe','razorpay'): raise HTTPException(404, 'Payment provider not found.')
+    id_key='stripe_price_id' if provider=='stripe' else 'razorpay_plan_id'
+    return {'provider':provider,'plans':[p for p in get_plan_catalog(db) if p.get(id_key)]}
+
+@router.post('/plans/provider/{provider}', status_code=201)
+def create_provider_plan(provider: str, body: ProviderPlanCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    if provider not in ('stripe','razorpay'): raise HTTPException(404, 'Payment provider not found.')
+    if body.slug == 'free': raise HTTPException(422, 'The Free plan does not use recurring checkout.')
+    plans=get_plan_catalog(db)
+    plan=next((p for p in plans if p['slug']==body.slug),None)
+    if plan is None:
+        plan={'slug':body.slug,'name':body.name,'active':True,'bots':body.bots,'documents':body.documents,'tokens':body.tokens,
+              'stripe_price_id':'','stripe_product_id':'','stripe_interval':'month','stripe_interval_count':1,'stripe_amount':None,'stripe_currency':'USD',
+              'razorpay_plan_id':'','razorpay_interval':'month','razorpay_interval_count':1,'razorpay_amount':None,'razorpay_currency':'INR'}
+        plans.append(plan)
+    else:
+        plan.update({'name':body.name,'active':True,'bots':body.bots,'documents':body.documents,'tokens':body.tokens})
+    currency=body.currency.upper()
+    previous_provider_id=plan.get('stripe_price_id' if provider=='stripe' else 'razorpay_plan_id')
+    try:
+        if provider=='stripe':
+            if not os.getenv('STRIPE_SECRET_KEY'): raise HTTPException(503,'Stripe secret key is not configured.')
+            import stripe
+            stripe.api_key=os.getenv('STRIPE_SECRET_KEY')
+            product=stripe.Product.create(name=body.name,metadata={'plan_slug':body.slug})
+            zero_decimal={'bif','clp','djf','gnf','jpy','kmf','krw','mga','pyg','rwf','ugx','vnd','vuv','xaf','xof','xpf'}
+            unit_amount=round(body.amount * (1 if currency.lower() in zero_decimal else 100))
+            price=stripe.Price.create(product=product.id,unit_amount=unit_amount,currency=currency.lower(),recurring={'interval':body.interval,'interval_count':body.interval_count})
+            plan.update({'stripe_price_id':price.id,'stripe_product_id':product.id,'stripe_amount':body.amount,'stripe_currency':currency,'stripe_interval':body.interval,'stripe_interval_count':body.interval_count})
+            if previous_provider_id:
+                try: stripe.Price.modify(previous_provider_id,active=False)
+                except Exception: pass
+        else:
+            key_id,secret=os.getenv('RAZORPAY_KEY_ID'),os.getenv('RAZORPAY_KEY_SECRET')
+            if not (key_id and secret): raise HTTPException(503,'Razorpay API credentials are not configured.')
+            response=httpx.post('https://api.razorpay.com/v1/plans',auth=(key_id,secret),json={'period':'monthly' if body.interval=='month' else 'yearly','interval':body.interval_count,'item':{'name':body.name,'amount':round(body.amount*100),'currency':currency,'description':f'{body.name} subscription'},'notes':{'plan_slug':body.slug}},timeout=20)
+            if response.status_code>=400: raise HTTPException(502,'Razorpay could not create the plan. Check the amount, currency, and API credentials.')
+            result=response.json()
+            if not result.get('id'): raise HTTPException(502,'Razorpay returned no plan ID.')
+            plan.update({'razorpay_plan_id':result['id'],'razorpay_amount':body.amount,'razorpay_currency':currency,'razorpay_interval':body.interval,'razorpay_interval_count':body.interval_count})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502,f'{provider.title()} could not create the recurring plan. Check the provider dashboard and API credentials.') from exc
+    _write_plan_catalog(db,plans)
+    write_audit(db,admin,'plan.provider_created','plan',body.slug,{'provider':provider,'name':body.name,'provider_plan_id':plan.get('stripe_price_id' if provider=='stripe' else 'razorpay_plan_id')})
+    db.commit()
+    return {'provider':provider,'plan':plan}
+
+@router.delete('/plans/provider/{provider}/{slug}')
+def remove_provider_plan(provider: str, slug: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    if provider not in ('stripe','razorpay'): raise HTTPException(404,'Payment provider not found.')
+    plans=get_plan_catalog(db)
+    plan=next((p for p in plans if p.get('slug')==slug),None)
+    if not plan: raise HTTPException(404,'Plan not found.')
+    id_key='stripe_price_id' if provider=='stripe' else 'razorpay_plan_id'
+    provider_id=plan.get(id_key)
+    if not provider_id: raise HTTPException(404,'Provider plan not found.')
+    if provider=='stripe':
+        if not os.getenv('STRIPE_SECRET_KEY'): raise HTTPException(503,'Stripe secret key is not configured.')
+        try:
+            import stripe
+            stripe.api_key=os.getenv('STRIPE_SECRET_KEY')
+            stripe.Price.modify(provider_id,active=False)
+        except Exception as exc: raise HTTPException(502,'Stripe could not deactivate this price.') from exc
+    # Razorpay subscription plans cannot be edited or deleted through its API. Remove
+    # the app mapping so it is no longer offered; existing subscriptions keep their plan ID.
+    plan[id_key]=''
+    if not plan.get('stripe_price_id') and not plan.get('razorpay_plan_id'):
+        if slug=='free': raise HTTPException(409,'The Free plan cannot be deleted.')
+        if not db.query(User).filter_by(plan=slug).first(): plan['active']=False
+    _write_plan_catalog(db,plans)
+    write_audit(db,admin,'plan.provider_removed','plan',slug,{'provider':provider,'provider_plan_id':provider_id})
+    db.commit()
+    return {'ok':True,'provider':provider,'slug':slug}
+
+@router.put('/plans')
+def save_plans(body: PlanCatalogUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    plans = [item.model_dump() for item in body.plans]
+    slugs = [item['slug'] for item in plans]
+    if len(slugs) != len(set(slugs)): raise HTTPException(422, 'Plan identifiers must be unique.')
+    if 'free' not in slugs: raise HTTPException(422, 'The Free plan cannot be removed.')
+    existing = {p['slug'] for p in get_plan_catalog(db)}
+    removed = existing - set(slugs)
+    for slug in removed:
+        if db.query(User).filter_by(plan=slug).first(): raise HTTPException(409, f"The '{slug}' plan is assigned to users and cannot be deleted yet.")
+    setting = db.get(AppSetting, 'plan_catalog')
+    value = json.dumps(plans, separators=(',', ':'))
+    if setting: setting.value, setting.updated_at = value, now()
+    else: db.add(AppSetting(key='plan_catalog', value=value, updated_at=now()))
+    write_audit(db, admin, 'plans.updated', 'plan_catalog', 'plan_catalog', {'plans': slugs})
+    db.commit()
+    return {'plans': get_plan_catalog(db)}
+
+@router.get('/plan-options')
+def admin_plan_options(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    return {'plans': [{'slug': p['slug'], 'name': p['name']} for p in get_plan_catalog(db)]}
+
+@router.put('/topups/packages')
+def save_topup_packages(body: TopupPackagesUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    packages = body.packages
+    if len(packages) > 50: raise HTTPException(422, 'You can configure up to 50 top-up packages.')
+    value = json.dumps([{'id': str(i), **item.model_dump()} for i, item in enumerate(packages)], separators=(',', ':'))
+    setting = db.get(AppSetting, 'topup_packages')
+    if setting: setting.value, setting.updated_at = value, now()
+    else: db.add(AppSetting(key='topup_packages', value=value, updated_at=now()))
+    write_audit(db, admin, 'topup_packages.updated', 'topup_packages', 'topup_packages', {'count': len(packages)})
+    db.commit()
+    return {'packages': _topup_catalog(db)}
 
 
 @router.get("/subscriptions")
@@ -116,7 +609,7 @@ def subscriptions(page: int = 1, limit: int = 25, db: Session = Depends(get_db),
 def update_payment_settings(body: PaymentProviderUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     if body.provider not in ("stripe", "razorpay"):
         raise HTTPException(422, "Choose Stripe or Razorpay.")
-    status = payment_provider_status()
+    status = payment_provider_status(db)
     if not status[body.provider]["configured"]:
         raise HTTPException(409, f"{body.provider.title()} is not configured. Add its required credentials and plan IDs to the API environment first.")
     previous = get_payment_provider(db)
@@ -210,7 +703,7 @@ def users(q: str = "", page: int = 1, limit: int = 25, db: Session = Depends(get
             "message_count": db.query(func.count(Message.id)).join(Bot, Message.bot_id == Bot.id).filter(Bot.user_id == account.id, Message.role == "user").scalar() or 0,
             "has_subscription": bool(account.subscription_id),
         })
-    return {"items": items, "total": total, "page": page, "limit": limit}
+    return {"items": items, "total": total, "page": page, "limit": limit, "plan_options": [{'slug': p['slug'], 'name': p['name']} for p in get_plan_catalog(db)]}
 
 
 @router.patch("/users/{user_id}")
@@ -220,11 +713,17 @@ def update_user(user_id: str, body: UserUpdate, db: Session = Depends(get_db), a
         raise HTTPException(404, "Account not found.")
     changes = {}
     if body.plan is not None:
-        if body.plan not in PLANS:
+        if body.plan not in {p['slug'] for p in get_plan_catalog(db)}:
             raise HTTPException(422, "Choose a valid plan.")
         if target.plan != body.plan:
             changes["plan"] = {"from": target.plan, "to": body.plan}
             target.plan = body.plan
+            if body.plan == 'free':
+                target.free_started_at = None
+                target.free_trial_used = 1
+                target.subscription_tokens = next(p['tokens'] for p in get_plan_catalog(db) if p['slug'] == 'free')
+            else:
+                target.subscription_tokens = next(p['tokens'] for p in get_plan_catalog(db) if p['slug'] == body.plan)
     if body.is_active is not None:
         desired = int(body.is_active)
         if not desired and target.id == admin.id:

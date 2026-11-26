@@ -73,10 +73,13 @@ Create an account with a password of at least 10 characters. Click **Try a demo*
 - Stripe subscription checkout, customer portal, signature verification, idempotent webhook handling and plan synchronization. Billing stays disabled without credentials.
 - Redis/Celery workers with persisted-job recovery, optional S3/R2 raw storage, Langfuse trace export, responsive Next.js dashboard, tests, CI and Docker Compose.
 - User profiles with Google account linking, a visible account menu/logout, subscription controls, and an in-app service setup guide.
+- Public customer documentation center with searchable sections and article pages; the global administrator can create, edit, publish, draft, order, and remove its content.
 - Visual Workflow Studio with drag-and-connect nodes, intents, captured variables, conditions, protected API calls, knowledge retrieval, draft testing, versioned publishing and optional execution in live chat.
 - Change-aware agent publishing: only changed settings create a new published major version. Subscribers can save minor draft snapshots, inspect history, and restore a prior published major version.
 
 See [workflow guide](docs/WORKFLOWS.md) for configuration and runtime behavior.
+
+Customer guides are available at `/docs`. Administrators can manage the published help center from **Admin console → Documentation**. New content is saved as a draft by default; publishing a page makes it public immediately.
 
 The proposed student learning portal is documented separately in [Phase Two: Student Learning Platform](docs/PHASE_2_STUDENT_LEARNING_PLATFORM.md). It is a planning specification; learner functionality is not implemented by this document.
 
@@ -96,8 +99,9 @@ Copy `.env.example` to `.env` at the repository root. The API reads this file on
 | `EMBEDDING_PROVIDER=openai` | Use OpenAI semantic embeddings; default `local` |
 | `REDIS_URL` | Enable Celery queue and Redis rate limiting; Compose configures this |
 | `S3_BUCKET`, `S3_ENDPOINT_URL`, `AWS_*` | S3 or R2 storage for uploaded knowledge files, agent logos, and the site logo |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST` | Optional external trace export |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST` | Optional Langfuse project API keys and regional host. Keys stay on the API server; configure them in the root `.env`. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Optional Google OAuth |
+
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Fallback if OpenAI fails before delivering text |
 | `EVAL_PROVIDER=openai`, `EVAL_SAMPLE_SIZE` | Enable paid synthetic QA evaluation, up to 20 samples |
 | `OPENAI_COMPLEX_MODEL` | Optional model for longer or comparative questions |
@@ -107,6 +111,12 @@ Copy `.env.example` to `.env` at the repository root. The API reads this file on
 | `RAZORPAY_PRO_PLAN_ID`, `RAZORPAY_TEAM_PLAN_ID` | Recurring Razorpay subscription plan IDs |
 | `PAYMENT_PROVIDER` | Initial gateway (`stripe` or `razorpay`); the admin console selection is stored in the database |
 | `INPUT_COST_PER_MILLION`, `OUTPUT_COST_PER_MILLION` | Token price estimates in USD, defaulting to the small-model estimate |
+
+### Langfuse observability
+
+Create/open a Langfuse project, then create project API keys from the project settings. Put the public and secret keys in `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in the root `.env`. Set `LANGFUSE_HOST` to the matching region (`https://cloud.langfuse.com` for EU, `https://us.cloud.langfuse.com` for US, or `https://jp.cloud.langfuse.com` for Japan), and restart the API and worker containers if using Docker Compose. Do not put these secrets in frontend environment variables.
+
+The API exports each chat as OpenTelemetry observations using Langfuse's current v4 ingestion endpoint. The global admin console has a **Langfuse traces** page that reads the latest 90 days of root observations and offers a custom date range with total tokens, cost, chat count, average latency, daily usage, and model breakdown. Aggregates come from Langfuse's Metrics API v2; access is protected by the same global admin check as other admin routes. New chat traces are exported after each completed response. See [Langfuse's OTEL ingestion guide](https://langfuse.com/integrations/native/opentelemetry), [Observations API](https://langfuse.com/docs/api-and-data-platform/features/public-api), and [Metrics API](https://langfuse.com/docs/metrics/features/metrics-api) for details.
 
 Stripe webhook endpoint: `/api/v1/webhooks/stripe`. Subscribe to `checkout.session.completed`, `customer.subscription.updated`, and `customer.subscription.deleted`. Razorpay webhook endpoint: `/api/v1/webhooks/razorpay`; subscribe to `subscription.activated`, `subscription.charged`, `subscription.resumed`, `subscription.cancelled`, `subscription.completed`, and `subscription.halted`. Use each provider's test credentials and matching test-mode plans/webhooks first. The server grants or removes paid access only from verified, deduplicated webhook events; a browser return alone does not upgrade an account. Select the active gateway in **Admin console → Payment provider**. Gateway credentials remain in the API environment, while the admin console stores only the selected provider.
 

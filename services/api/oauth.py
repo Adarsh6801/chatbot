@@ -1,12 +1,14 @@
 import hmac
 import os
 import secrets
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from .database import get_db, User
+from .database import get_db, User, now
 from .config import PRODUCTION, PUBLIC_WEB_URL
+from .plan_catalog import get_plan_limits, get_plan
 from .security import password_hash, current_user
 from sqlalchemy.exc import IntegrityError
 
@@ -57,7 +59,9 @@ async def google_callback(request:Request, code:str='', state:str='', db=Depends
     else: user=db.query(User).filter_by(google_sub=info['sub']).first() or db.query(User).filter_by(email=email).first()
     if user and not user.is_active: raise HTTPException(403,'This account has been suspended. Contact support.')
     if not user:
-        user=User(email=email,name=info.get('name','Builder')[:80],password=password_hash(secrets.token_urlsafe(48)))
+        free_enabled = get_plan(db, 'free') is not None
+        free_started_at = now() if free_enabled else (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        user=User(email=email,name=info.get('name','Builder')[:80],password=password_hash(secrets.token_urlsafe(48)),free_started_at=free_started_at,free_trial_used=1,subscription_tokens=get_plan_limits(db, 'free')['tokens'] if free_enabled else 0)
         db.add(user)
     user.google_sub=info['sub']
     if str(info.get('picture','')).startswith('https://'): user.avatar_url=info['picture'][:2000]

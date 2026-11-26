@@ -7,7 +7,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `Request failed (${response.status}). Check your input.`);
   return data;
 }
-export type Bot = {id:string; name:string; description:string; slug:string; public_key:string; system_prompt:string; threshold:number; published:boolean; draft_changed?:boolean; draft_needs_save?:boolean; version_history_enabled?:boolean; published_version?:string|null; documents:number; messages:number; widget_config:{color:string; greeting:string; position:string; logo:string; launcher_icon?:string}};
+export type Bot = {id:string; name:string; description:string; slug:string; public_key:string; system_prompt:string; threshold:number; published:boolean; draft_changed?:boolean; draft_needs_save?:boolean; version_history_enabled?:boolean; published_version?:string|null; documents:number; messages:number; widget_config:{color:string; greeting:string; position:string; logo:string; launcher_icon?:string; chat_template_id?:string; chat_customization?:Record<string, string | number | boolean>; chat_theme?:Record<string, string | number | boolean>}};
 export type Citation = {index:number; source:string; excerpt:string};
 export type ChatMessage = {role:'user'|'assistant'; content:string; citations?:Citation[]; confidence?:number; model?:string};
 export async function streamChat(key:string, message:string, visitor:string, conversation:string|null, onEvent:(event:string,data:any)=>void, publicView=false, userId?:string, userName?:string) {
