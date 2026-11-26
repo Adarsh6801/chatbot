@@ -14,3 +14,6 @@
 @media(max-width:760px){.marketing-nav{background:rgba(255,255,255,.96)}.marketing-nav .marketing-links{border-color:#e7e9e2}}
 
 .hero-stage{-webkit-user-select:none;user-select:none}
+.hero-wave-word{display:inline-block;transform-origin:50% 65%;will-change:transform}
+.marketing-hero h1 em .hero-wave-word{background:inherit;background-clip:text;-webkit-background-clip:text;color:transparent}
+@media(prefers-reduced-motion:reduce){.hero-wave-word{transform:none!important;will-change:auto}}

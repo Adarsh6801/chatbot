@@ -3,10 +3,13 @@
 import { useEffect, useRef } from "react";
 
 type Particle = { x: number; y: number; homeX: number; homeY: number; vx: number; vy: number; angle: number; spin: number; size: number; color: string; alpha: number; phase: number; stiffness: number; damping: number; scale: number };
+export type WaveRipple = { x: number; y: number; radius: number; age: number };
 
-export default function AntigravityCanvas({ pulse }: { pulse: number }) {
+export default function AntigravityCanvas({ pulse, onWaveFrame }: { pulse: number; onWaveFrame?: (ripples: ReadonlyArray<WaveRipple>, dt: number) => void }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const pulseRef = useRef(pulse);
+  const onWaveFrameRef = useRef(onWaveFrame);
+  onWaveFrameRef.current = onWaveFrame;
   useEffect(() => { if (pulse > pulseRef.current) window.dispatchEvent(new CustomEvent("agentforge:canvas-pulse")); pulseRef.current = pulse; }, [pulse]);
 
   useEffect(() => {
@@ -58,6 +61,7 @@ export default function AntigravityCanvas({ pulse }: { pulse: number }) {
         const scaleTarget = 1 + falloff * .28; p.scale += (scaleTarget - p.scale) * .15 * dt;
         if (pointerActive && falloff > .035) drawShape(p, .16 + falloff * .8);
       }
+      onWaveFrameRef.current?.(ripples, dt);
       for (const wave of ripples) { wave.radius += 5.2 * dt; wave.age += 16.67 * dt; }
       while (ripples.length && (ripples[0].radius > Math.max(width, height) * .62 || ripples[0].age > 1200)) ripples.shift();
       if (animate) frame = requestAnimationFrame((next) => tick(next, true));
