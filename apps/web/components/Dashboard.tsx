@@ -533,10 +533,11 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                   {selected.published ? "Live" : "Draft"}
                 </span>
               </div>
-              <div className="tabs">
+              <div className="tabs" data-tour="agent-tabs">
                 {tabs.map((t) => (
                   <button
                     className={tab === t ? "active" : ""}
+                    data-tour={`tab-${t.toLowerCase()}`}
                     key={t}
                     onClick={() => navigateTab(t)}
                   >
@@ -564,7 +565,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                   </h1>
                   <p>Your knowledge. A conversation away.</p>
                 </div>
-                <button className="primary" onClick={() => setModal(true)}>
+                <button className="primary" data-tour="create-agent-btn" onClick={() => setModal(true)}>
                   <Plus size={17} /> Create agent
                 </button>
               </div>
@@ -650,6 +651,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
                 {filtered.map((bot, i) => (
                   <div
                     className="agent-card"
+                    data-tour={i === 0 ? "agent-card" : undefined}
                     key={bot.id}
                     onClick={() => navigateAgent(bot, "Workflow")}
                     onContextMenu={(event) => showAgentMenu(event, bot)}
@@ -1189,7 +1191,7 @@ function AgentDetail({
               />
             )}
           </div>
-          <div className="panel add-source">
+          <div className="panel add-source" data-tour="knowledge-add-box">
             <h3>Add knowledge</h3>
             <div className="segmented">
               {["upload", "website", "text"].map((m) => (
@@ -1497,7 +1499,7 @@ function AgentDetail({
           </p>
           <div className="agent-publish-controls">
             {bot.version_history_enabled && bot.draft_needs_save && <button className="secondary" disabled={busy} onClick={() => void saveDraftVersion()}><FileText size={14}/>Save draft version</button>}
-            <button className="primary" disabled={busy || (bot.published && !bot.draft_changed)} onClick={() => void publishCurrentDraft()}>{bot.published ? bot.draft_changed ? "Publish major version" : `Published${bot.published_version ? ` · v${bot.published_version}` : ""}` : "Publish agent"}<ArrowRight size={16}/></button>
+            <button className="primary" data-tour="publish-agent-btn" disabled={busy || (bot.published && !bot.draft_changed)} onClick={() => void publishCurrentDraft()}>{bot.published ? bot.draft_changed ? "Publish major version" : `Published${bot.published_version ? ` · v${bot.published_version}` : ""}` : "Publish agent"}<ArrowRight size={16}/></button>
             {bot.published && <button className="secondary" disabled={busy} onClick={() => action(() => api(base,{method:"PATCH",body:JSON.stringify({published:false})}),"Agent unpublished.")}>Unpublish</button>}
           </div>
           <p className="agent-publish-status">{bot.draft_changed ? "Draft changes are ready to publish." : bot.published ? `This version is live${bot.published_version ? ` · v${bot.published_version}` : ""}.` : "Publish this agent when it is ready."}</p>
@@ -2139,7 +2141,7 @@ function Keys({
             placeholder="e.g. Website integration"
           />
         </label>
-        <button className="primary">
+        <button className="primary" data-tour="create-api-key-btn">
           Create key <Plus size={16} />
         </button>
       </form>

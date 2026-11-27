@@ -59,7 +59,12 @@ def migrate():
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (9) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (10) ON CONFLICT (version) DO NOTHING'))
         connection.execute(text('INSERT INTO schema_versions (version) VALUES (11) ON CONFLICT (version) DO NOTHING'))
+        connection.execute(text('INSERT INTO schema_versions (version) VALUES (12) ON CONFLICT (version) DO NOTHING'))
     with Session() as db:
+        from .site_bot_seed import ensure_site_bot_seeded
+        from .site_pages import ensure_site_pages_seeded
+        ensure_site_bot_seeded(db)
+        ensure_site_pages_seeded(db)
         if not db.get(AppSetting, 'documentation_seed_v1'):
             from .documentation_content import DEFAULT_DOCUMENTATION
             for section in DEFAULT_DOCUMENTATION:

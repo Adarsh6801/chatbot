@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -52,6 +53,10 @@ from .admin import router as admin_router
 app.include_router(admin_router)
 from .documentation import router as documentation_router
 app.include_router(documentation_router)
+from .site_bot import router as site_bot_router
+app.include_router(site_bot_router)
+from .site_pages import router as site_pages_router
+app.include_router(site_pages_router)
 from .support import router as support_router
 app.include_router(support_router)
 from .billing import router as billing_router
@@ -589,15 +594,24 @@ def widget_config(key: str, request: Request, response: Response, db: DBSession 
     return {'name': public_agent_config(bot)['name'], 'chat_url': PUBLIC_WEB_URL + '/chat/' + bot.slug, 'widget_config': public_widget_config(bot, request, db)}
 
 @app.get('/api/v1/public/site-settings')
-def public_site_settings(request: Request, db: DBSession = Depends(get_db)):
+def public_site_settings(request: Request, response: Response, db: DBSession = Depends(get_db)):
     setting = db.get(AppSetting,'site_branding')
     try: branding = json.loads(setting.value) if setting else {}
     except (TypeError,json.JSONDecodeError): branding = {}
     logo = str(branding.get('logo') or '')
-    return {'name':str(branding.get('name') or 'AgentForge'),'logo_url':str(request.base_url).rstrip('/')+'/api/v1/public/site-logo' if logo else ''}
+    brand_display = str(branding.get('brand_display') or 'both')
+    if brand_display not in ('both', 'image', 'text'):
+        brand_display = 'both'
+    version = hashlib.sha256(logo.encode()).hexdigest()[:12] if logo else ''
+    response.headers['Cache-Control'] = 'no-store'
+    return {
+        'name': str(branding.get('name') or 'AgentForge'),
+        'logo_url': f"{str(request.base_url).rstrip('/')}/api/v1/public/site-logo?v={version}" if logo else '',
+        'brand_display': brand_display,
+    }
 
 @app.get('/api/v1/public/site-logo')
-def public_site_logo(db: DBSession = Depends(get_db)):
+def public_site_logo(request: Request, db: DBSession = Depends(get_db)):
     setting = db.get(AppSetting,'site_branding')
     try: branding = json.loads(setting.value) if setting else {}
     except (TypeError,json.JSONDecodeError): branding = {}
@@ -608,7 +622,8 @@ def public_site_logo(db: DBSession = Depends(get_db)):
         logging.getLogger('agentforge').exception('Site logo could not be loaded')
         raise HTTPException(502,'Site logo storage is unavailable.')
     if content_type != 'image/png': raise HTTPException(404,'Site logo not found.')
-    return Response(content,media_type='image/png',headers={'Cache-Control':'public, max-age=3600','X-Content-Type-Options':'nosniff'})
+    cache_header = 'public, max-age=31536000, immutable' if request.query_params.get('v') else 'no-cache, must-revalidate'
+    return Response(content,media_type='image/png',headers={'Cache-Control':cache_header,'X-Content-Type-Options':'nosniff'})
 
 def public_widget_config(bot, request, db):
     config = dict(public_agent_config(bot).get('widget_config') or {})

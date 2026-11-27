@@ -8,4 +8,5 @@
 
 .chat-new-session{font-size:10px;white-space:nowrap}
 
-.brand-icon img{width:34px;height:36px;object-fit:cover;border-radius:9px;transform:rotate(4deg)}
+.brand-icon img,img.brand-icon{width:auto;max-width:150px;height:38px;object-fit:contain;border-radius:8px;display:block;flex:none;background:transparent}
+img.brand-mode-image,img.brand-icon.brand-mode-image{width:auto;max-width:205px;height:48px;object-fit:contain;border-radius:6px;transform:none}

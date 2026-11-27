@@ -1,0 +1,161 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      WEB_DOMAIN: ${WEB_DOMAIN:?Set WEB_DOMAIN in .env}
+      ADMIN_DOMAIN: ${ADMIN_DOMAIN:?Set ADMIN_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+      admin:
+        condition: service_started
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    command: [redis-server, --appendonly, "yes", --maxmemory, "128mb", --maxmemory-policy, allkeys-lru]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    logging: *default-logging
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agentforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-agentforge}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ${POSTGRES_USER:-agentforge} -d ${POSTGRES_DB:-agentforge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    logging: *default-logging
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.api
+    command: [uvicorn, services.api.main:app, --host, 0.0.0.0, --port, "8000", --workers, "2", --proxy-headers, --forwarded-allow-ips, "*"]
+    environment: &api_environment
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-agentforge}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agentforge}
+      APP_ENV: production
+      WEB_ORIGIN: https://${WEB_DOMAIN}
+      ADMIN_WEB_ORIGIN: https://${ADMIN_DOMAIN}
+      PUBLIC_WEB_URL: https://${WEB_DOMAIN}
+      ADMIN_USER_ID: ${ADMIN_USER_ID:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PRO_PRICE_ID: ${STRIPE_PRO_PRICE_ID:-}
+      STRIPE_TEAM_PRICE_ID: ${STRIPE_TEAM_PRICE_ID:-}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-stripe}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      RAZORPAY_PRO_PLAN_ID: ${RAZORPAY_PRO_PLAN_ID:-}
+      RAZORPAY_TEAM_PLAN_ID: ${RAZORPAY_TEAM_PLAN_ID:-}
+      REDIS_URL: redis://redis:6379/0
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EVAL_PROVIDER: ${EVAL_PROVIDER:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_KEY_PREFIX: ${S3_KEY_PREFIX:-documents}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: https://${WEB_DOMAIN}/api/v1/auth/google/callback
+      WORKFLOW_ENCRYPTION_KEY: ${WORKFLOW_ENCRYPTION_KEY:?Set WORKFLOW_ENCRYPTION_KEY in .env}
+    volumes:
+      - api_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.api
+    environment: *api_environment
+    command: [celery, -A, services.api.workers.celery, worker, --beat, --schedule=/tmp/celerybeat-schedule, --loglevel=info, --concurrency=1]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: https://${WEB_DOMAIN}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+  admin:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.admin
+      args:
+        NEXT_PUBLIC_API_URL: https://${ADMIN_DOMAIN}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
+  redis_data:
+  api_data:

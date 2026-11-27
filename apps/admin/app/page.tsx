@@ -3,20 +3,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
-import { Activity, Bot, BookOpen, ChevronLeft, ChevronRight, CircleHelp, CreditCard, Eye, LayoutDashboard, LogOut, MessageSquareText, RefreshCw, Search, Shield, ShieldAlert, Users, X, Settings2, Upload, Image as ImageIcon, Sparkles, Zap } from "lucide-react";
+import { Activity, Bot, BookOpen, ChevronLeft, ChevronRight, CircleHelp, CreditCard, Eye, FileText, LayoutDashboard, LogOut, MessageSquareText, RefreshCw, Search, Shield, ShieldAlert, Users, X, Settings2, Upload, Image as ImageIcon, Sparkles, Zap } from "lucide-react";
 import { api, API } from "@/lib/api";
 import type { AdminAgent, AdminUser, AuditEvent } from "@/lib/api";
 import { SupportEditor, SupportMessageView } from "./SupportRichText";
 import DocumentationAdmin from "./DocumentationAdmin";
+import PagesAdmin from "./PagesAdmin";
+import SiteBotAdmin from "./SiteBotAdmin";
 import UserDetailModal from "./UserDetailModal";
 import "./payments.css";
 import "./langfuse.css";
 
 type Admin = { id: string; name: string; email: string; is_admin: boolean };
-type View = "overview" | "users" | "agents" | "conversations" | "tickets" | "activity" | "payments" | "plans" | "chat-templates" | "langfuse" | "documentation" | "site";
+type View = "overview" | "users" | "agents" | "conversations" | "tickets" | "activity" | "payments" | "plans" | "chat-templates" | "langfuse" | "documentation" | "pages" | "site-bot" | "site";
 type PageResult<T> = { items: T[]; total: number; page: number; limit: number; plan_options?: {slug:string;name:string}[] };
 type DateRange = { from: string; to: string };
-const labels: Record<View, string> = { overview: "Dashboard", users: "Users", agents: "Agents", conversations: "Conversations", tickets: "Support tickets", activity: "Admin activity", payments: "Payment provider", plans: "Plans management", "chat-templates": "Chat templates", langfuse: "Langfuse traces", documentation: "Documentation", site: "Site settings" };
+const labels: Record<View, string> = { overview: "Dashboard", users: "Users", agents: "Agents", conversations: "Conversations", tickets: "Support tickets", activity: "Admin activity", payments: "Payment provider", plans: "Plans management", "chat-templates": "Chat templates", langfuse: "Langfuse traces", documentation: "Documentation", pages: "Pages", "site-bot": "Website bot", site: "Site settings" };
 
 function date(value?: string) { return value ? new Date(value).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "—"; }
 function dateInputValue(value: Date) { return `${value.getFullYear()}-${String(value.getMonth()+1).padStart(2,"0")}-${String(value.getDate()).padStart(2,"0")}`; }
@@ -26,12 +28,56 @@ function Badge({ children, tone = "gray" }: { children: ReactNode; tone?: "gray"
 async function cropSiteLogo(file: File): Promise<Blob> {
   if (file.size > 10 * 1024 * 1024) throw new Error("Choose an image under 10 MB.");
   const bitmap = await createImageBitmap(file);
-  const side = Math.min(bitmap.width, bitmap.height);
-  const canvas = document.createElement("canvas");canvas.width=256;canvas.height=256;
+  const srcCanvas = document.createElement("canvas");
+  srcCanvas.width = bitmap.width;
+  srcCanvas.height = bitmap.height;
+  const srcCtx = srcCanvas.getContext("2d");
+  if (!srcCtx) {bitmap.close();throw new Error("Your browser could not process this image.");}
+  srcCtx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  // Safely trim excess uniform margins (e.g. wide padding around wordmark logos)
+  let sx = 0, sy = 0, sw = srcCanvas.width, sh = srcCanvas.height;
+  if (sw * sh <= 4096 * 4096) {
+    const imgData = srcCtx.getImageData(0, 0, sw, sh).data;
+    const cornerAlpha = imgData[3];
+    const r0 = imgData[0], g0 = imgData[1], b0 = imgData[2];
+    const isBg = (idx: number) => {
+      const a = imgData[idx + 3];
+      if (cornerAlpha < 20) return a < 20;
+      if (a < 20) return true;
+      return Math.abs(imgData[idx] - r0) + Math.abs(imgData[idx + 1] - g0) + Math.abs(imgData[idx + 2] - b0) < 36;
+    };
+    let minX = sw, minY = sh, maxX = -1, maxY = -1;
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        if (!isBg((y * sw + x) * 4)) {
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX > minX && maxY > minY) {
+      const pad = Math.max(2, Math.round(Math.max(maxX - minX, maxY - minY) * 0.02));
+      sx = Math.max(0, minX - pad);
+      sy = Math.max(0, minY - pad);
+      sw = Math.min(srcCanvas.width - sx, maxX - minX + 1 + pad * 2);
+      sh = Math.min(srcCanvas.height - sy, maxY - minY + 1 + pad * 2);
+    }
+  }
+
+  const scale = Math.min(640 / sw, 256 / sh, 1);
+  const width = Math.max(32, Math.round(sw * scale));
+  const height = Math.max(32, Math.round(sh * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
   const context = canvas.getContext("2d");
-  if (!context) {bitmap.close();throw new Error("Your browser could not crop this image.");}
-  context.drawImage(bitmap,(bitmap.width-side)/2,(bitmap.height-side)/2,side,side,0,0,256,256);bitmap.close();
-  return await new Promise((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error("Could not create the cropped logo.")),"image/png"));
+  if (!context) throw new Error("Your browser could not process this image.");
+  context.drawImage(srcCanvas, sx, sy, sw, sh, 0, 0, width, height);
+  return await new Promise((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error("Could not create the PNG logo.")),"image/png"));
 }
 
 export default function AdminConsole() {
@@ -50,8 +96,11 @@ export default function AdminConsole() {
   const [langfuseRange, setLangfuseRange] = useState<DateRange>(()=>lastDaysRange(7));
   const [langfuseDraftRange, setLangfuseDraftRange] = useState<DateRange>(langfuseRange);
   const [documentationRefreshToken, setDocumentationRefreshToken] = useState(0);
-  const [siteSettings, setSiteSettings] = useState<{name:string;logo_url:string;has_logo:boolean}>({name:"AgentForge",logo_url:"",has_logo:false});
+  const [pagesRefreshToken, setPagesRefreshToken] = useState(0);
+  const [siteBotRefreshToken, setSiteBotRefreshToken] = useState(0);
+  const [siteSettings, setSiteSettings] = useState<{name:string;logo_url:string;has_logo:boolean;brand_display:"both"|"image"|"text"}>({name:"AgentForge",logo_url:"",has_logo:false,brand_display:"both"});
   const [siteName, setSiteName] = useState("AgentForge");
+  const [brandDisplay, setBrandDisplay] = useState<"both"|"image"|"text">("both");
   const [siteLogoChanged, setSiteLogoChanged] = useState(false);
   const [siteLogoUploading, setSiteLogoUploading] = useState(false);
   const [rows, setRows] = useState<PageResult<any> | null>(null);
@@ -75,8 +124,9 @@ export default function AdminConsole() {
     setPaymentSettings(settings);setPaymentRows(records);setSubscriptionRows(subscriptions);
   }, [page]);
   const refreshSiteSettings = useCallback(async () => {
-    const result = await api<{name:string;logo_url:string;has_logo:boolean}>("/admin/settings/site");
-    setSiteSettings(result);setSiteName(result.name);setSiteLogoChanged(false);
+    const result = await api<{name:string;logo_url:string;has_logo:boolean;brand_display?:"both"|"image"|"text"}>("/admin/settings/site");
+    const mode = result.brand_display === "image" || result.brand_display === "text" ? result.brand_display : "both";
+    setSiteSettings({...result, brand_display: mode});setSiteName(result.name);setBrandDisplay(mode);setSiteLogoChanged(false);
   }, []);
   const refreshLangfuse = useCallback(async (cursor?: string) => {
     const query = new URLSearchParams({limit:"50"}); if(cursor) query.set("cursor",cursor);
@@ -93,8 +143,9 @@ export default function AdminConsole() {
   }, []);
 
   useEffect(() => {
-    api<{name:string;logo_url:string}>('/public/site-settings').then(branding=>{
-      setSiteName(branding.name);setSiteSettings(current=>({...current,name:branding.name,logo_url:branding.logo_url,has_logo:!!branding.logo_url}));
+    api<{name:string;logo_url:string;brand_display?:"both"|"image"|"text"}>('/public/site-settings').then(branding=>{
+      const mode = branding.brand_display === "image" || branding.brand_display === "text" ? branding.brand_display : "both";
+      setSiteName(branding.name);setBrandDisplay(mode);setSiteSettings(current=>({...current,name:branding.name,logo_url:branding.logo_url,has_logo:!!branding.logo_url,brand_display:mode}));
     }).catch(() => {});
     api<{google_enabled:boolean}>('/auth/config').then(config=>setGoogle(config.google_enabled)).catch(()=>setGoogle(false));
     api<Admin>("/auth/me").then((me) => {
@@ -106,7 +157,7 @@ export default function AdminConsole() {
   useEffect(() => {
     if (!admin) return;
     setError("");
-    const task = view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : view === "site" ? refreshSiteSettings() : view === "langfuse" ? refreshLangfuse() : view === "documentation" || view === "plans" ? Promise.resolve() : refreshRows(view, page, submittedQuery);
+    const task = view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : view === "site" ? refreshSiteSettings() : view === "langfuse" ? refreshLangfuse() : view === "documentation" || view === "plans" || view === "pages" || view === "site-bot" ? Promise.resolve() : refreshRows(view, page, submittedQuery);
     task.catch((e) => setError(e.message));
   }, [admin, view, page, submittedQuery, refreshOverview, refreshPaymentSettings, refreshSiteSettings, refreshLangfuse, refreshRows]);
 
@@ -191,7 +242,7 @@ export default function AdminConsole() {
   async function saveSiteSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();setBusy(true);setError("");
     try {
-      await api("/admin/settings/site",{method:"PUT",body:JSON.stringify({name:siteName,logo:siteLogoChanged?"":undefined})});
+      await api("/admin/settings/site",{method:"PUT",body:JSON.stringify({name:siteName,logo:siteLogoChanged?"":undefined,brand_display:brandDisplay})});
       await refreshSiteSettings();setError("");
     } catch(e) {setError((e as Error).message);} finally {setBusy(false);}
   }
@@ -247,18 +298,18 @@ export default function AdminConsole() {
   if (checking) return <div className="center"><div className="loader"/>Checking secure admin session…</div>;
   if (!admin) return <main className="login-page"><div className="login-card"><div className="logo">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt=""/>:<Shield size={22}/>}</div><p className="eyebrow">{siteName.toUpperCase()} · PLATFORM</p><h1>Admin console</h1><p className="subtle">Sign in with the Google account configured as the platform administrator.</p>{denied && <div className="error-box"><ShieldAlert size={17}/><span>{loginError || "This account does not have global administrator access."}</span></div>}<button type="button" className="admin-google-login" disabled={google===null} onClick={()=>google?window.location.assign(`${API}/api/v1/auth/google/start?admin=true`):setLoginError("Google sign-in is not connected yet. Configure the Google OAuth client and restart the API.")}><span className="admin-google-mark">G</span>Continue with Google</button>{google===false&&<p className="google-login-hint">Google sign-in is not configured.</p>}{loginError&&!denied&&<div className="error-box">{loginError}</div>}<p className="login-foot"><Shield size={14}/> Admin access is enforced by the API.</p></div></main>;
 
-  const nav: { id: View; icon: LucideIcon }[] = [{ id: "overview", icon: LayoutDashboard }, { id: "users", icon: Users }, { id: "agents", icon: Bot }, { id: "conversations", icon: MessageSquareText }, { id: "tickets", icon: CircleHelp }, { id: "payments", icon: CreditCard }, { id: "plans", icon: Zap }, { id: "chat-templates", icon: MessageSquareText }, { id: "langfuse", icon: Sparkles }, { id: "documentation", icon: BookOpen }, { id: "activity", icon: Activity }, { id: "site", icon: Settings2 }];
+  const nav: { id: View; icon: LucideIcon }[] = [{ id: "overview", icon: LayoutDashboard }, { id: "users", icon: Users }, { id: "agents", icon: Bot }, { id: "conversations", icon: MessageSquareText }, { id: "tickets", icon: CircleHelp }, { id: "payments", icon: CreditCard }, { id: "plans", icon: Zap }, { id: "chat-templates", icon: MessageSquareText }, { id: "langfuse", icon: Sparkles }, { id: "documentation", icon: BookOpen }, { id: "pages", icon: FileText }, { id: "site-bot", icon: Bot }, { id: "activity", icon: Activity }, { id: "site", icon: Settings2 }];
   const pages = Math.max(1, Math.ceil((rows?.total || 0) / (rows?.limit || 25)));
 
   return <div className={view === "chat-templates" ? "shell appearance-shell" : "shell"}>
     <aside className="sidebar">
-      <div className="brand"><div className="brand-mark">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt=""/>:<Shield size={19}/>}</div><div><strong>{siteSettings.name}</strong><small>Platform admin</small></div></div>
+      <div className="brand">{siteSettings.brand_display !== "text" && <div className={`brand-mark${siteSettings.brand_display === "image" && siteSettings.logo_url ? " brand-mode-image" : ""}`}>{siteSettings.logo_url?<img src={siteSettings.logo_url} alt={siteSettings.name} style={siteSettings.brand_display === "image" ? { objectFit: "contain" } : undefined}/>:<Shield size={19}/>}</div>}{!(siteSettings.brand_display === "image" && siteSettings.logo_url) && <div><strong>{siteSettings.name}</strong><small>Platform admin</small></div>}</div>
       <div className="side-caption">CONTROL CENTER</div>
       <nav>{nav.map(({ id, icon: Icon }) => <button key={id} className={view === id ? "selected" : ""} onClick={() => { setView(id); setPage(1); setRows(null); }}><Icon size={18}/>{labels[id]}{id === "users" && overview && <span className="nav-badge">{overview.users}</span>}{id === "tickets" && supportUnread > 0 && <span className="nav-badge">{supportUnread}</span>}</button>)}</nav>
       <div className="sidebar-bottom"><div className="admin-chip"><div className="avatar">{admin.name?.[0]?.toUpperCase() || "A"}</div><div><strong>{admin.name}</strong><small>Super administrator</small></div></div><button className="logout" onClick={logout}><LogOut size={16}/>Sign out</button></div>
     </aside>
     <main className="main">
-      <header className="topbar"><div><span className="crumb">Platform</span><ChevronRight size={14}/><strong>{labels[view]}</strong></div><div className="top-actions"><span className="secure"><i/> Private admin</span><button className="icon-button" title="Refresh" onClick={() => (view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : view === "site" ? refreshSiteSettings() : view === "langfuse" ? refreshLangfuse() : view === "documentation" ? (setDocumentationRefreshToken(value=>value+1),Promise.resolve()) : view === "plans" ? Promise.resolve() : refreshRows(view, page, submittedQuery)).catch(e => setError(e.message))}><RefreshCw size={16}/></button><div className="avatar small">{admin.name?.[0]?.toUpperCase() || "A"}</div></div></header>
+      <header className="topbar"><div><span className="crumb">Platform</span><ChevronRight size={14}/><strong>{labels[view]}</strong></div><div className="top-actions"><span className="secure"><i/> Private admin</span><button className="icon-button" title="Refresh" onClick={() => (view === "overview" ? Promise.all([refreshOverview(), refreshRows("activity", 1, "")]) : view === "payments" ? refreshPaymentSettings() : view === "site" ? refreshSiteSettings() : view === "langfuse" ? refreshLangfuse() : view === "documentation" ? (setDocumentationRefreshToken(value=>value+1),Promise.resolve()) : view === "pages" ? (setPagesRefreshToken(value=>value+1),Promise.resolve()) : view === "site-bot" ? (setSiteBotRefreshToken(value=>value+1),Promise.resolve()) : view === "plans" ? Promise.resolve() : refreshRows(view, page, submittedQuery)).catch(e => setError(e.message))}><RefreshCw size={16}/></button><div className="avatar small">{admin.name?.[0]?.toUpperCase() || "A"}</div></div></header>
       <div className={view === "chat-templates" ? "content appearance-content" : "content"}>
         {ticketNotice && <div className="ticket-notice"><CircleHelp size={16}/><span>{ticketNotice}</span><button onClick={()=>setTicketNotice("")} aria-label="Dismiss notification"><X size={14}/></button></div>}
         {error && <div className="error-banner"><CircleHelp size={16}/>{error}<button onClick={() => setError("")}><X size={15}/></button></div>}
@@ -273,7 +324,9 @@ export default function AdminConsole() {
         {view === "chat-templates" && <AppearanceStudio onExit={()=>setView("overview")}/>}
         {view === "langfuse" && <LangfuseView data={langfuseData} metrics={langfuseMetrics} metricsLoading={langfuseMetricsLoading} range={langfuseRange} draftRange={langfuseDraftRange} onDraftRange={setLangfuseDraftRange} onApplyRange={()=>setLangfuseRange(langfuseDraftRange)} onPreset={days=>{const range=lastDaysRange(days);setLangfuseDraftRange(range);setLangfuseRange(range);}} onMore={()=>langfuseData?.cursor&&refreshLangfuse(langfuseData.cursor)}/>}
         {view === "documentation" && <DocumentationAdmin refreshToken={documentationRefreshToken}/>}
-        {view === "site" && <><PageHeading eyebrow="BRAND IDENTITY" title="Site settings" description="Set the application name and logo shown throughout the website and admin panel."/><form className="panel site-settings-panel" onSubmit={saveSiteSettings}><label>Application name<input value={siteName} onChange={event=>setSiteName(event.target.value)} maxLength={80} required/></label><div className="site-logo-settings"><div><h2>Application logo</h2><p>Upload an image and we’ll center-crop it to a fixed 256 × 256 PNG for consistent display.</p></div><div className="site-logo-preview">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt="Application logo preview"/>:<span><ImageIcon size={25}/></span>}</div></div><label className="site-logo-upload secondary"><Upload size={15}/>{siteLogoUploading?"Cropping and uploading…":"Choose logo image"}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={siteLogoUploading||busy} onChange={event=>{const file=event.currentTarget.files?.[0];if(file)void uploadSiteLogo(file);event.currentTarget.value="";}}/></label><small className="site-logo-help">PNG, JPG, WEBP, or GIF · maximum 10 MB · center-cropped to 256 × 256</small>{siteSettings.has_logo&&!siteLogoChanged&&<button type="button" className="danger-outline site-logo-remove" onClick={()=>{setSiteSettings(current=>({...current,has_logo:false,logo_url:""}));setSiteLogoChanged(true);}}>Remove logo</button>}{siteLogoChanged&&<p className="site-logo-pending">Logo removal will take effect when you save.</p>}<div className="site-settings-footer"><span>Branding changes appear across the public site after the next page load.</span><button className="primary" disabled={busy||siteLogoUploading}>Save site settings</button></div></form></>}
+        {view === "pages" && <PagesAdmin refreshToken={pagesRefreshToken}/>}
+        {view === "site-bot" && <SiteBotAdmin refreshToken={siteBotRefreshToken}/>}
+        {view === "site" && <><PageHeading eyebrow="BRAND IDENTITY" title="Site settings" description="Set the application name, logo image, and whether the website shows the image, text, or both."/><form className="panel site-settings-panel" onSubmit={saveSiteSettings}><label>Application name<input value={siteName} onChange={event=>setSiteName(event.target.value)} maxLength={80} required/></label><label>Brand header display<select value={brandDisplay} onChange={event=>setBrandDisplay(event.target.value as "both"|"image"|"text")}><option value="both">Image + Text (show logo beside name)</option><option value="image">Image only (show logo without text)</option><option value="text">Text only (show application name without logo)</option></select></label><div className="site-logo-settings"><div><h2>Application logo</h2><p>Upload a PNG, JPG, WEBP, or GIF logo (fits up to 512 × 256 PNG while keeping your full image shape).</p></div><div className="site-logo-preview" style={{ width: brandDisplay === "image" ? 150 : 82 }}>{siteSettings.logo_url?<img src={siteSettings.logo_url} alt="Application logo preview" style={{ objectFit: brandDisplay === "image" ? "contain" : "cover" }}/>:<span><ImageIcon size={25}/></span>}</div></div><div className="site-logo-settings" style={{ background: "#fafbfc" }}><div><h2>Website header preview</h2><p>Live preview of how your brand appears across the site navbar and dashboard.</p></div><div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", borderRadius: 10, background: "#fff", border: "1px solid var(--line)" }}>{brandDisplay !== "text" && (siteSettings.logo_url ? <img src={siteSettings.logo_url} alt={siteName} style={{ height: 32, width: brandDisplay === "image" ? "auto" : 32, maxWidth: 160, objectFit: brandDisplay === "image" ? "contain" : "cover", borderRadius: 7 }} /> : <span className="brand-mark" style={{ width: 32, height: 32 }}><Shield size={16} /></span>)}{!(brandDisplay === "image" && siteSettings.logo_url) && <strong style={{ fontSize: 15 }}>{siteName || "AgentForge"}</strong>}</div></div><label className="site-logo-upload secondary"><Upload size={15}/>{siteLogoUploading?"Processing and uploading…":"Choose logo image"}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={siteLogoUploading||busy} onChange={event=>{const file=event.currentTarget.files?.[0];if(file)void uploadSiteLogo(file);event.currentTarget.value="";}}/></label><small className="site-logo-help">PNG, JPG, WEBP, or GIF · maximum 10 MB · automatically converted to PNG (up to 512 × 256)</small>{siteSettings.has_logo&&!siteLogoChanged&&<button type="button" className="danger-outline site-logo-remove" onClick={()=>{setSiteSettings(current=>({...current,has_logo:false,logo_url:""}));setSiteLogoChanged(true);if(brandDisplay==="image")setBrandDisplay("both");}}>Remove logo</button>}{siteLogoChanged&&<p className="site-logo-pending">Logo removal will take effect when you save.</p>}<div className="site-settings-footer"><span>Branding changes appear across the public website automatically.</span><button className="primary" disabled={busy||siteLogoUploading}>Save site settings</button></div></form></>}
       </div>
     </main>
     {viewedUserId && <UserDetailModal userId={viewedUserId} onClose={() => setViewedUserId(null)} onUpdated={async () => { await Promise.all([refreshRows("users", page, submittedQuery), refreshOverview()]); }} onOpenConversation={openConversation} onOpenTicket={openSupportTicket} />}

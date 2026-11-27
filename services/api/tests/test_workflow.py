@@ -313,3 +313,264 @@ def test_admin_user_view_and_edits_audit_logged(client,owner,bot,monkeypatch):
     actions=[entry['action'] for entry in refreshed['logs']['admin_audit']]
     for expected in ('user.updated','agent.updated','user.api_key_revoked','user.sessions_revoked'):
         assert expected in actions
+
+
+def _sample_pdf_bytes(text: str) -> bytes:
+    safe = text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+    stream = f"BT /F1 12 Tf 72 720 Td ({safe}) Tj ET".encode('latin1')
+    objs = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+        b"4 0 obj\n<< /Length " + str(len(stream)).encode('ascii') + b" >>\nstream\n" + stream + b"\nendstream\nendobj\n",
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for obj in objs:
+        offsets.append(len(out))
+        out.extend(obj)
+    xref_pos = len(out)
+    out.extend(f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode('ascii'))
+    for off in offsets:
+        out.extend(f"{off:010d} 00000 n \n".encode('ascii'))
+    out.extend(f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode('ascii'))
+    return bytes(out)
+
+
+def test_website_bot_sloty_companion_kb_pdfs_walkthroughs_and_admin(client, owner, monkeypatch):
+    from fastapi.testclient import TestClient
+    from services.api.database import AdminAudit
+
+    cfg_res = client.get('/api/v1/site-bot/config')
+    assert cfg_res.status_code == 200, cfg_res.text
+    cfg = cfg_res.json()
+    assert cfg['enabled'] is True
+    assert cfg['name'] == 'Sloty'
+    assert any(w['slug'] == 'build-your-first-agent' for w in cfg['walkthroughs'])
+
+    guest_client = TestClient(client.app)
+    guest_headers = {
+        'X-Forwarded-For': '203.0.113.45',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0.0.0 Safari/537.36',
+    }
+    guide_chat = guest_client.post(
+        '/api/v1/site-bot/chat',
+        headers=guest_headers,
+        json={'message': 'Guide me step-by-step to build my first bot', 'visitor_id': 'guest-visitor-1001', 'current_page': '/'},
+    )
+    assert guide_chat.status_code == 200, guide_chat.text
+    guide_msg = guide_chat.json()['message']
+    assert any(a['type'] == 'walkthrough' and a['walkthrough_slug'] == 'build-your-first-agent' for a in guide_msg['actions'])
+
+    redir_chat = guest_client.post(
+        '/api/v1/site-bot/chat',
+        headers=guest_headers,
+        json={
+            'message': 'Take me to API documentation and tell me the chat endpoint',
+            'visitor_id': 'guest-visitor-1001',
+            'conversation_id': guide_chat.json()['conversation_id'],
+            'current_page': '/',
+        },
+    )
+    assert redir_chat.status_code == 200, redir_chat.text
+    redir_msg = redir_chat.json()['message']
+    assert any(a['type'] == 'redirect' and a['route'] == '/api-docs' and a.get('auto') is True for a in redir_msg['actions'])
+    assert '/api/v1/chat/' in redir_msg['content'] or any('/api-docs' in (c.get('url') or '') for c in redir_msg['citations'])
+
+    owner_headers = {
+        'X-Forwarded-For': '198.51.100.22',
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) Safari/604.1',
+    }
+    owner_chat = owner.post(
+        '/api/v1/site-bot/chat',
+        headers=owner_headers,
+        json={'message': 'Who are you?', 'visitor_id': 'owner-visitor-2002', 'current_page': '/agents'},
+    )
+    assert owner_chat.status_code == 200, owner_chat.text
+    assert 'Sloty' in owner_chat.json()['message']['content']
+    hist = owner.get('/api/v1/site-bot/history', params={'visitor_id': 'owner-visitor-2002'})
+    assert hist.status_code == 200 and len(hist.json()['messages']) == 2
+
+    assert owner.get('/api/v1/admin/site-bot').status_code == 403
+
+    admin_client = TestClient(client.app)
+    admin_client.headers['X-AgentForge-Client'] = 'dashboard'
+    reg = admin_client.post('/api/v1/auth/register', json={'name': 'Site Bot Admin', 'email': 'sitebot-admin@example.com', 'password': 'AdminPassword123!'})
+    assert reg.status_code in (200, 201), reg.text
+    admin_id = admin_client.get('/api/v1/auth/me').json()['id']
+    monkeypatch.setenv('ADMIN_USER_ID', admin_id)
+
+    renamed = admin_client.patch('/api/v1/admin/site-bot/config', json={'name': 'NovaGuide', 'accent_color': '#2f6c58'})
+    assert renamed.status_code == 200 and renamed.json()['config']['name'] == 'NovaGuide'
+    assert client.get('/api/v1/site-bot/config').json()['name'] == 'NovaGuide'
+    admin_client.patch('/api/v1/admin/site-bot/config', json={'name': 'Sloty'})
+
+    kb_add = admin_client.post('/api/v1/admin/site-bot/knowledge', json={'title': 'Custom SLA', 'content': 'Enterprise workspaces include dedicated 99.95% uptime SLA.'})
+    assert kb_add.status_code == 201, kb_add.text
+    kb_id = kb_add.json()['id']
+    kb_edit = admin_client.patch('/api/v1/admin/site-bot/knowledge/' + kb_id, json={'content': 'Enterprise workspaces include dedicated 99.99% SLA and onboarding.'})
+    assert kb_edit.status_code == 200
+
+    pdf_bytes = _sample_pdf_bytes('Sloty PDF Manual: Dedicated onboarding runs within 24 hours.')
+    pdf_upload = admin_client.post('/api/v1/admin/site-bot/knowledge/upload', files={'file': ('manual.pdf', pdf_bytes, 'application/pdf')})
+    assert pdf_upload.status_code == 201, pdf_upload.text
+    assert pdf_upload.json()['source_type'] == 'pdf' and pdf_upload.json()['chunk_count'] >= 1
+
+    pdf_qa = guest_client.post(
+        '/api/v1/site-bot/chat',
+        headers=guest_headers,
+        json={'message': 'How fast does dedicated onboarding run according to the Sloty PDF Manual?', 'visitor_id': 'guest-visitor-1001', 'conversation_id': guide_chat.json()['conversation_id'], 'current_page': '/plans'},
+    )
+    assert pdf_qa.status_code == 200 and '24 hours' in pdf_qa.json()['message']['content']
+
+    wt = admin_client.post('/api/v1/admin/site-bot/walkthroughs', json={
+        'slug': 'check-billing-tokens',
+        'title': 'Check billing & tokens',
+        'description': 'Inspect your remaining token balance',
+        'keywords': ['billing tokens', 'token balance'],
+        'steps': [{'title': 'Step 1', 'instruction': 'Review your remaining tokens here.', 'route': '/plans', 'selector': '', 'action_label': 'Inspect', 'auto_advance_on_click': False}],
+    })
+    assert wt.status_code == 201, wt.text
+    wt_id = wt.json()['id']
+    assert admin_client.patch('/api/v1/admin/site-bot/walkthroughs/' + wt_id, json={'title': 'Inspect billing & token balance'}).status_code == 200
+    assert admin_client.delete('/api/v1/admin/site-bot/walkthroughs/' + wt_id).status_code == 200
+    assert admin_client.delete('/api/v1/admin/site-bot/knowledge/' + kb_id).status_code == 200
+
+    convs = admin_client.get('/api/v1/admin/site-bot/conversations')
+    assert convs.status_code == 200
+    items = convs.json()['items']
+    guest_row = next(c for c in items if c['visitor_id'] == 'guest-visitor-1001')
+    assert guest_row['ip_address'] == '203.0.113.45'
+    assert 'Desktop' in guest_row['device_summary'] and 'Chrome' in guest_row['device_summary']
+    assert guest_row['user_id'] is None
+
+    owner_row = next(c for c in items if c['visitor_id'] == 'owner-visitor-2002')
+    assert owner_row['ip_address'] == '198.51.100.22'
+    assert 'Mobile' in owner_row['device_summary'] and 'iOS' in owner_row['device_summary']
+    assert owner_row['user_email'] == 'owner@example.com' and owner_row['user_id'] is not None
+
+    detail = admin_client.get('/api/v1/admin/site-bot/conversations/' + guest_row['id'])
+    assert detail.status_code == 200 and len(detail.json()['messages']) >= 4
+
+    with Session() as db:
+        audit_actions = [e.action for e in db.query(AdminAudit).all()]
+        for expected in ('site_bot.config_updated', 'site_bot.knowledge_created', 'site_bot.knowledge_uploaded', 'site_bot.walkthrough_created'):
+            assert expected in audit_actions
+
+
+def test_site_logo_updates_cache_busted_public_url(client, monkeypatch):
+    import struct
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv('S3_BUCKET', 'test-branding-bucket')
+    fake_store = {}
+    counter = {'n': 0}
+
+    def fake_store_site_logo(raw):
+        counter['n'] += 1
+        uri = f"s3://test-branding-bucket/site-assets/branding/logo-{counter['n']}.png"
+        fake_store[uri] = raw
+        return uri
+
+    def fake_read_site_logo(uri):
+        return fake_store[uri], 'image/png'
+
+    monkeypatch.setattr('services.api.admin.store_site_logo', fake_store_site_logo)
+    monkeypatch.setattr('services.api.main.read_site_logo', fake_read_site_logo)
+
+    admin_client = TestClient(client.app)
+    admin_client.headers['X-AgentForge-Client'] = 'dashboard'
+    reg = admin_client.post('/api/v1/auth/register', json={'name': 'Brand Admin', 'email': 'brand-admin@example.com', 'password': 'AdminPassword123!'})
+    assert reg.status_code in (200, 201), reg.text
+    admin_id = admin_client.get('/api/v1/auth/me').json()['id']
+    monkeypatch.setenv('ADMIN_USER_ID', admin_id)
+
+    png_header = b'\x89PNG\r\n\x1a\n' + struct.pack('>I4sII', 13, b'IHDR', 256, 256)
+    first_png = png_header + b'first-logo-bytes'
+    second_png = png_header + b'second-logo-bytes'
+
+    assert admin_client.put('/api/v1/admin/settings/site', json={'name': 'MyBrand', 'brand_display': 'image'}).status_code == 422
+
+    up1 = admin_client.post('/api/v1/admin/settings/site/logo', files={'file': ('logo1.png', first_png, 'image/png')})
+    assert up1.status_code == 200 and '?v=' in up1.json()['logo_url']
+    pub1 = client.get('/api/v1/public/site-settings')
+    assert pub1.status_code == 200 and pub1.headers.get('cache-control') == 'no-store'
+    assert pub1.json()['brand_display'] == 'both'
+    url1 = pub1.json()['logo_url']
+    assert '?v=' in url1
+
+    save_img = admin_client.put('/api/v1/admin/settings/site', json={'name': 'MyBrand', 'brand_display': 'image'})
+    assert save_img.status_code == 200 and save_img.json()['brand_display'] == 'image'
+    assert client.get('/api/v1/public/site-settings').json()['brand_display'] == 'image'
+
+    up2 = admin_client.post('/api/v1/admin/settings/site/logo', files={'file': ('logo2.png', second_png, 'image/png')})
+    assert up2.status_code == 200
+    pub2 = client.get('/api/v1/public/site-settings')
+    url2 = pub2.json()['logo_url']
+    assert url2 != url1
+    path_and_query = url2.replace(str(client.base_url), '')
+    fetched = client.get(path_and_query)
+    assert fetched.status_code == 200 and fetched.content == second_png
+
+    save_txt = admin_client.put('/api/v1/admin/settings/site', json={'name': 'MyBrand', 'brand_display': 'text'})
+    assert save_txt.status_code == 200 and client.get('/api/v1/public/site-settings').json()['brand_display'] == 'text'
+
+
+def test_admin_pages_and_public_faqs_terms_privacy(client, owner, monkeypatch):
+    from fastapi.testclient import TestClient
+    from services.api.database import AdminAudit
+
+    for slug in ('faqs', 'terms', 'privacy'):
+        pub = client.get('/api/v1/public/pages/' + slug)
+        assert pub.status_code == 200, pub.text
+        assert pub.json()['slug'] == slug
+    assert len(client.get('/api/v1/public/pages/faqs').json()['faqs']) >= 1
+
+    assert owner.get('/api/v1/admin/pages').status_code == 403
+
+    admin_client = TestClient(client.app)
+    admin_client.headers['X-AgentForge-Client'] = 'dashboard'
+    reg = admin_client.post('/api/v1/auth/register', json={'name': 'Pages Admin', 'email': 'pages-admin@example.com', 'password': 'AdminPassword123!'})
+    assert reg.status_code in (200, 201), reg.text
+    admin_id = admin_client.get('/api/v1/auth/me').json()['id']
+    monkeypatch.setenv('ADMIN_USER_ID', admin_id)
+
+    listed = admin_client.get('/api/v1/admin/pages')
+    assert listed.status_code == 200
+    assert [p['slug'] for p in listed.json()['items']] == ['faqs', 'terms', 'privacy']
+
+    terms_detail = admin_client.get('/api/v1/admin/pages/terms')
+    assert terms_detail.status_code == 200 and 'content' in terms_detail.json()
+
+    updated_terms = admin_client.patch('/api/v1/admin/pages/terms', json={'title': 'Updated Terms', 'content': '## Clause 1\nRespect workspace limits.'})
+    assert updated_terms.status_code == 200 and updated_terms.json()['title'] == 'Updated Terms'
+    assert 'Clause 1' in client.get('/api/v1/public/pages/terms').json()['content']
+
+    hidden_privacy = admin_client.patch('/api/v1/admin/pages/privacy', json={'status': 'draft'})
+    assert hidden_privacy.status_code == 200
+    assert client.get('/api/v1/public/pages/privacy').status_code == 404
+    assert admin_client.patch('/api/v1/admin/pages/privacy', json={'status': 'published'}).status_code == 200
+    assert client.get('/api/v1/public/pages/privacy').status_code == 200
+
+    created_faq = admin_client.post('/api/v1/admin/pages/faqs/items', json={
+        'question': 'Does Sloty support PDF knowledge?',
+        'answer': 'Yes, upload PDFs directly in the Admin Website Bot console.',
+        'category': 'Website Bot',
+        'position': 99,
+        'published': True,
+    })
+    assert created_faq.status_code == 201, created_faq.text
+    faq_id = created_faq.json()['id']
+    assert any(f['id'] == faq_id for f in client.get('/api/v1/public/pages/faqs').json()['faqs'])
+
+    edited_faq = admin_client.patch('/api/v1/admin/pages/faqs/items/' + faq_id, json={'answer': 'Yes, upload readable PDFs up to 10 MB.'})
+    assert edited_faq.status_code == 200 and '10 MB' in edited_faq.json()['answer']
+
+    assert admin_client.delete('/api/v1/admin/pages/faqs/items/' + faq_id).status_code == 200
+    assert not any(f['id'] == faq_id for f in client.get('/api/v1/public/pages/faqs').json()['faqs'])
+
+    with Session() as db:
+        actions = [e.action for e in db.query(AdminAudit).all()]
+        for expected in ('site_page.updated', 'faq.created', 'faq.updated', 'faq.deleted'):
+            assert expected in actions

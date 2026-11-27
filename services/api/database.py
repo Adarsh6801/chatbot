@@ -312,6 +312,108 @@ class BotActivityLog(Base):
     details = Column(JSON, default=dict)
     created_at = Column(String, default=now, nullable=False)
 
+
+class SiteBotConfig(Base):
+    __tablename__ = 'site_bot_config'
+    id = Column(String, primary_key=True, default='default')
+    enabled = Column(Integer, nullable=False, default=1)
+    name = Column(String, nullable=False, default='Sloty')
+    tagline = Column(String, nullable=False, default='Your AI companion across the platform')
+    greeting = Column(Text, nullable=False, default="Hey there! I'm Sloty — your friendly platform companion. Ask me anything about building bots, PDFs, workflows, or our APIs, or tell me where you want to go and I'll guide you step by step!")
+    system_prompt = Column(Text, nullable=False, default='You are Sloty, a warm, proactive companion guide built into this platform. Speak like a helpful teammate, guide users step-by-step on what to click next, explain our platform features and API documentation clearly, offer page redirects when helpful, and trigger interactive walkthroughs whenever a user wants hands-on guidance.')
+    accent_color = Column(String, nullable=False, default='#bf5b00')
+    position = Column(String, nullable=False, default='right')
+    include_api_docs = Column(Integer, nullable=False, default=1)
+    suggested_prompts = Column(JSON, default=list)
+    updated_at = Column(String, default=now, nullable=False)
+
+
+class SiteBotKnowledge(Base):
+    __tablename__ = 'site_bot_knowledge'
+    id = Column(String, primary_key=True, default=uid)
+    title = Column(String, nullable=False)
+    source_type = Column(String, nullable=False, default='text')
+    content = Column(Text, nullable=False)
+    chunk_count = Column(Integer, nullable=False, default=0)
+    enabled = Column(Integer, nullable=False, default=1)
+    created_at = Column(String, default=now, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
+
+
+class SiteBotChunk(Base):
+    __tablename__ = 'site_bot_chunks'
+    id = Column(String, primary_key=True, default=uid)
+    knowledge_id = Column(String, ForeignKey('site_bot_knowledge.id'), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    embedding = Column(JSON, nullable=False)
+    embedding_model = Column(String, nullable=False, default='local:feature-hash-256')
+    ordinal = Column(Integer, nullable=False, default=0)
+
+
+class SiteBotWalkthrough(Base):
+    __tablename__ = 'site_bot_walkthroughs'
+    id = Column(String, primary_key=True, default=uid)
+    slug = Column(String, unique=True, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=False, default='')
+    keywords = Column(JSON, default=list)
+    steps = Column(JSON, default=list)
+    enabled = Column(Integer, nullable=False, default=1)
+    position = Column(Integer, nullable=False, default=0)
+    created_at = Column(String, default=now, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
+
+
+class SiteBotConversation(Base):
+    __tablename__ = 'site_bot_conversations'
+    __table_args__ = (Index('ix_site_bot_conv_updated', 'updated_at'),)
+    id = Column(String, primary_key=True, default=uid)
+    visitor_id = Column(String, nullable=False, index=True)
+    user_id = Column(String, nullable=True, index=True)
+    user_email = Column(String, nullable=True)
+    user_name = Column(String, nullable=True)
+    ip_address = Column(String, nullable=False, default='unknown')
+    user_agent = Column(Text, nullable=False, default='')
+    device_summary = Column(String, nullable=False, default='Unknown device')
+    current_page = Column(String, nullable=False, default='/')
+    created_at = Column(String, default=now, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
+
+
+class SiteBotMessage(Base):
+    __tablename__ = 'site_bot_messages'
+    id = Column(String, primary_key=True, default=uid)
+    conversation_id = Column(String, ForeignKey('site_bot_conversations.id'), nullable=False, index=True)
+    role = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    actions = Column(JSON, default=list)
+    citations = Column(JSON, default=list)
+    page_path = Column(String, nullable=False, default='/')
+    created_at = Column(String, default=now, nullable=False)
+
+
+class SitePage(Base):
+    __tablename__ = 'site_pages'
+    slug = Column(String, primary_key=True)
+    title = Column(String, nullable=False)
+    subtitle = Column(Text, nullable=False, default='')
+    content = Column(Text, nullable=False, default='')
+    status = Column(String, nullable=False, default='published')
+    updated_at = Column(String, default=now, nullable=False)
+
+
+class FaqItem(Base):
+    __tablename__ = 'faq_items'
+    id = Column(String, primary_key=True, default=uid)
+    question = Column(Text, nullable=False)
+    answer = Column(Text, nullable=False)
+    category = Column(String, nullable=False, default='General')
+    position = Column(Integer, nullable=False, default=0)
+    published = Column(Integer, nullable=False, default=1)
+    created_at = Column(String, default=now, nullable=False)
+    updated_at = Column(String, default=now, nullable=False)
+
+
 def get_db():
     with Session() as db:
         yield db

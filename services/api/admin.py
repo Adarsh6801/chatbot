@@ -1,5 +1,5 @@
 """Global platform administration endpoints, isolated from workspace APIs."""
-import os, json, struct, asyncio, re
+import os, json, struct, asyncio, re, hashlib
 
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Request, Response, Query
 from pydantic import BaseModel, Field, field_validator
@@ -9,7 +9,21 @@ from sqlalchemy.orm import Session
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, BillingAttempt, Bot, BotActivityLog, Chunk, Conversation, Document, DocumentationCategory, DocumentationPage, Flag, LoginSession, Message, Payment, SupportTicket, SupportTicketMessage, TokenUsage, User, Workflow, get_db, now, uid
+from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, BillingAttempt, Bot, BotActivityLog, Chunk, Conversation, Document, DocumentationCategory, DocumentationPage, FaqItem, Flag, LoginSession, Message, Payment, SiteBotChunk, SiteBotConfig, SiteBotConversation, SiteBotKnowledge, SiteBotMessage, SiteBotWalkthrough, SitePage, SupportTicket, SupportTicketMessage, TokenUsage, User, Workflow, get_db, now, uid
+from .ingestion import MAX_BYTES, parse_file
+from .site_bot import (
+    SiteBotConfigPatch,
+    SiteBotKnowledgeInput,
+    SiteBotKnowledgePatch,
+    SiteBotWalkthroughInput,
+    SiteBotWalkthroughPatch,
+    index_site_knowledge,
+    serialize_config as serialize_site_bot_config,
+    serialize_knowledge as serialize_site_bot_knowledge,
+    serialize_walkthrough as serialize_site_bot_walkthrough,
+)
+from .site_bot_seed import ensure_site_bot_seeded
+from .site_pages import ensure_site_pages_seeded, serialize_faq, serialize_site_page
 from .payment_settings import get_payment_provider, payment_provider_status
 from .security import current_user
 from .providers import store_site_logo, read_site_logo
@@ -156,6 +170,7 @@ class ProviderPlanCreate(BaseModel):
 class SiteSettingsUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     logo: str | None = None
+    brand_display: Literal["both", "image", "text"] | None = None
 
     @field_validator('name')
     @classmethod
@@ -666,39 +681,47 @@ def get_site_branding(db: Session) -> dict:
     setting = db.get(AppSetting, "site_branding")
     try: data = json.loads(setting.value) if setting else {}
     except (TypeError, json.JSONDecodeError): data = {}
-    return {"name": str(data.get("name") or "AgentForge"), "logo": str(data.get("logo") or "")}
+    mode = str(data.get("brand_display") or "both")
+    if mode not in ("both", "image", "text"):
+        mode = "both"
+    return {"name": str(data.get("name") or "AgentForge"), "logo": str(data.get("logo") or ""), "brand_display": mode}
 
 
 @router.get("/settings/site")
 def site_settings(request: Request, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
     branding = get_site_branding(db)
-    logo_url = str(request.base_url).rstrip('/') + "/api/v1/admin/settings/site/logo" if branding["logo"] else ""
-    return {"name":branding["name"],"logo_url":logo_url,"has_logo":bool(branding["logo"])}
+    version = hashlib.sha256(branding["logo"].encode()).hexdigest()[:12] if branding["logo"] else ""
+    logo_url = f"{str(request.base_url).rstrip('/')}/api/v1/admin/settings/site/logo?v={version}" if branding["logo"] else ""
+    return {"name":branding["name"],"logo_url":logo_url,"has_logo":bool(branding["logo"]),"brand_display":branding["brand_display"]}
 
 
 @router.put("/settings/site")
 def update_site_settings(body: SiteSettingsUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     current = get_site_branding(db)
     logo = current["logo"] if body.logo is None else body.logo.strip()
+    brand_display = body.brand_display or current["brand_display"]
     bucket = os.getenv('S3_BUCKET')
     if logo and (not bucket or not logo.startswith(f's3://{bucket}/site-assets/branding/')):
         raise HTTPException(422,"Choose a logo uploaded to this workspace's S3 bucket.")
+    if brand_display == "image" and not logo:
+        raise HTTPException(422,"Upload a logo image before setting display mode to Image only.")
     setting = db.get(AppSetting,"site_branding")
-    value = json.dumps({"name":body.name,"logo":logo},separators=(',',':'))
+    value = json.dumps({"name":body.name,"logo":logo,"brand_display":brand_display},separators=(',',':'))
     if setting: setting.value,setting.updated_at = value,now()
     else: db.add(AppSetting(key="site_branding",value=value))
-    write_audit(db,admin,"site_branding.updated","site_settings","site_branding",{"name":body.name,"logo_updated":logo != current["logo"]})
+    write_audit(db,admin,"site_branding.updated","site_settings","site_branding",{"name":body.name,"logo_updated":logo != current["logo"],"brand_display":brand_display})
     db.commit()
-    return {"name":body.name,"has_logo":bool(logo)}
+    return {"name":body.name,"has_logo":bool(logo),"brand_display":brand_display}
 
 
 @router.post("/settings/site/logo")
 async def upload_site_logo(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     if not os.getenv('S3_BUCKET'): raise HTTPException(503,"Configure S3_BUCKET before uploading a site logo.")
     raw = await file.read(2 * 1024 * 1024 + 1)
-    valid_png = len(raw) >= 24 and raw.startswith(b'\x89PNG\r\n\x1a\n') and struct.unpack('>II',raw[16:24]) == (256,256)
+    dims = struct.unpack('>II',raw[16:24]) if len(raw) >= 24 and raw.startswith(b'\x89PNG\r\n\x1a\n') else (0, 0)
+    valid_png = 32 <= dims[0] <= 1024 and 32 <= dims[1] <= 512
     if len(raw) > 2 * 1024 * 1024 or not valid_png:
-        raise HTTPException(422,"Upload a logo cropped to a 256 × 256 PNG image.")
+        raise HTTPException(422,"Upload a valid PNG logo (32–1024 px wide, 32–512 px tall, under 2 MB).")
     try: logo = await asyncio.to_thread(store_site_logo,raw)
     except Exception:
         raise HTTPException(502,"Logo upload failed. Check the S3 connection and try again.")
@@ -709,18 +732,20 @@ async def upload_site_logo(request: Request, file: UploadFile = File(...), db: S
     else: db.add(AppSetting(key="site_branding",value=value))
     write_audit(db,admin,"site_branding.logo_uploaded","site_settings","site_branding",{"bytes":len(raw)})
     db.commit()
-    logo_url = str(request.base_url).rstrip('/') + "/api/v1/admin/settings/site/logo"
+    version = hashlib.sha256(logo.encode()).hexdigest()[:12]
+    logo_url = f"{str(request.base_url).rstrip('/')}/api/v1/admin/settings/site/logo?v={version}"
     return {"logo_url":logo_url,"has_logo":True}
 
 
 @router.get("/settings/site/logo")
-def admin_site_logo(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+def admin_site_logo(request: Request, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
     logo = get_site_branding(db)["logo"]
     if not logo: raise HTTPException(404,"No site logo has been uploaded.")
     try: content, content_type = read_site_logo(logo)
     except Exception: raise HTTPException(502,"Site logo storage is unavailable.")
     if content_type != "image/png": raise HTTPException(404,"Site logo not found.")
-    return Response(content,media_type="image/png",headers={"Cache-Control":"private, max-age=3600","X-Content-Type-Options":"nosniff"})
+    cache_header = "private, max-age=31536000, immutable" if request.query_params.get("v") else "no-cache, must-revalidate"
+    return Response(content,media_type="image/png",headers={"Cache-Control":cache_header,"X-Content-Type-Options":"nosniff"})
 
 
 @router.get("/users")
@@ -1140,3 +1165,473 @@ def update_support_ticket(ticket_id: str, body: SupportStatusUpdate, db: Session
                     {"subject": ticket.subject, "from": previous, "to": body.status})
     db.commit()
     return {"ok": True, "status": ticket.status}
+
+
+@router.get("/site-bot")
+def get_site_bot_admin(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    config = ensure_site_bot_seeded(db)
+    knowledge = db.query(SiteBotKnowledge).order_by(SiteBotKnowledge.updated_at.desc()).all()
+    walkthroughs = db.query(SiteBotWalkthrough).order_by(SiteBotWalkthrough.position.asc(), SiteBotWalkthrough.title.asc()).all()
+    total_convs = db.query(func.count(SiteBotConversation.id)).scalar() or 0
+    total_msgs = db.query(func.count(SiteBotMessage.id)).scalar() or 0
+    logged_in_convs = db.query(func.count(SiteBotConversation.id)).filter(SiteBotConversation.user_id.isnot(None)).scalar() or 0
+    total_chunks = db.query(func.count(SiteBotChunk.id)).scalar() or 0
+    return {
+        "config": serialize_site_bot_config(config),
+        "knowledge": [serialize_site_bot_knowledge(item) for item in knowledge],
+        "walkthroughs": [serialize_site_bot_walkthrough(g) for g in walkthroughs],
+        "stats": {
+            "conversations": total_convs,
+            "messages": total_msgs,
+            "logged_in_conversations": logged_in_convs,
+            "knowledge_sources": len(knowledge),
+            "knowledge_chunks": total_chunks,
+        },
+    }
+
+
+@router.patch("/site-bot/config")
+def update_site_bot_config(body: SiteBotConfigPatch, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    config = ensure_site_bot_seeded(db)
+    changes = {}
+    for field in ("name", "tagline", "greeting", "system_prompt", "accent_color", "position"):
+        val = getattr(body, field)
+        if val is not None:
+            clean = val.strip() if field in ("tagline", "greeting", "system_prompt") else val
+            if getattr(config, field) != clean:
+                changes[field] = {"from": getattr(config, field), "to": clean} if field in ("name", "accent_color", "position") else {"changed": True}
+                setattr(config, field, clean)
+    for bool_field in ("enabled", "include_api_docs"):
+        val = getattr(body, bool_field)
+        if val is not None and bool(getattr(config, bool_field)) != val:
+            changes[bool_field] = {"from": bool(getattr(config, bool_field)), "to": val}
+            setattr(config, bool_field, int(val))
+    if body.suggested_prompts is not None:
+        cleaned_prompts = [p.strip()[:140] for p in body.suggested_prompts if p.strip()]
+        if list(config.suggested_prompts or []) != cleaned_prompts:
+            changes["suggested_prompts"] = {"count": len(cleaned_prompts)}
+            config.suggested_prompts = cleaned_prompts
+    if changes:
+        config.updated_at = now()
+        write_audit(db, admin, "site_bot.config_updated", "site_bot", "default", changes)
+        db.commit()
+    return {"ok": True, "config": serialize_site_bot_config(config)}
+
+
+@router.post("/site-bot/knowledge", status_code=201)
+async def create_site_bot_knowledge(body: SiteBotKnowledgeInput, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    ensure_site_bot_seeded(db)
+    item = SiteBotKnowledge(title=body.title, source_type="text", content=body.content, enabled=int(body.enabled))
+    db.add(item)
+    db.flush()
+    try:
+        await index_site_knowledge(db, item)
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(422, str(error))
+    write_audit(db, admin, "site_bot.knowledge_created", "site_bot_knowledge", item.id, {"title": item.title, "source_type": "text", "chunks": item.chunk_count})
+    db.commit()
+    return serialize_site_bot_knowledge(item)
+
+
+@router.post("/site-bot/knowledge/upload", status_code=201)
+async def upload_site_bot_knowledge(
+    file: UploadFile = File(...),
+    title: str | None = Query(default=None, max_length=200),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    ensure_site_bot_seeded(db)
+    raw = await file.read(MAX_BYTES + 1)
+    filename = file.filename or "document.pdf"
+    try:
+        extracted = parse_file(filename, raw)
+    except ValueError as error:
+        raise HTTPException(422, str(error))
+    if not extracted.strip():
+        raise HTTPException(422, "No readable text found in this document. Scanned PDFs require OCR before upload.")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "text"
+    source_type = "pdf" if ext == "pdf" else ext if ext in ("docx", "txt", "md") else "text"
+    item = SiteBotKnowledge(
+        title=(title or filename).strip()[:200],
+        source_type=source_type,
+        content=extracted.strip(),
+        enabled=1,
+    )
+    db.add(item)
+    db.flush()
+    try:
+        await index_site_knowledge(db, item)
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(422, str(error))
+    write_audit(db, admin, "site_bot.knowledge_uploaded", "site_bot_knowledge", item.id, {"title": item.title, "source_type": source_type, "chunks": item.chunk_count})
+    db.commit()
+    return serialize_site_bot_knowledge(item)
+
+
+@router.patch("/site-bot/knowledge/{item_id}")
+async def update_site_bot_knowledge(item_id: str, body: SiteBotKnowledgePatch, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    item = db.get(SiteBotKnowledge, item_id)
+    if not item:
+        raise HTTPException(404, "Knowledge source not found.")
+    changes = {}
+    if body.title is not None:
+        clean_title = body.title.strip()
+        if not clean_title:
+            raise HTTPException(422, "Title cannot be blank.")
+        if item.title != clean_title:
+            changes["title"] = {"from": item.title, "to": clean_title}
+            item.title = clean_title
+    if body.enabled is not None and bool(item.enabled) != body.enabled:
+        changes["enabled"] = {"from": bool(item.enabled), "to": body.enabled}
+        item.enabled = int(body.enabled)
+    if body.content is not None:
+        clean_content = body.content.strip()
+        if not clean_content:
+            raise HTTPException(422, "Content cannot be blank.")
+        if item.content != clean_content:
+            changes["content"] = {"changed": True}
+            item.content = clean_content
+            try:
+                await index_site_knowledge(db, item)
+            except ValueError as error:
+                db.rollback()
+                raise HTTPException(422, str(error))
+    if changes:
+        item.updated_at = now()
+        write_audit(db, admin, "site_bot.knowledge_updated", "site_bot_knowledge", item.id, {"title": item.title, **changes})
+        db.commit()
+    return serialize_site_bot_knowledge(item)
+
+
+@router.delete("/site-bot/knowledge/{item_id}")
+def delete_site_bot_knowledge(item_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    item = db.get(SiteBotKnowledge, item_id)
+    if not item:
+        raise HTTPException(404, "Knowledge source not found.")
+    write_audit(db, admin, "site_bot.knowledge_deleted", "site_bot_knowledge", item.id, {"title": item.title, "source_type": item.source_type})
+    db.query(SiteBotChunk).filter_by(knowledge_id=item.id).delete()
+    db.delete(item)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/site-bot/walkthroughs", status_code=201)
+def create_site_bot_walkthrough(body: SiteBotWalkthroughInput, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    ensure_site_bot_seeded(db)
+    if db.query(SiteBotWalkthrough).filter_by(slug=body.slug).first():
+        raise HTTPException(409, "A walkthrough with this slug already exists.")
+    guide = SiteBotWalkthrough(
+        slug=body.slug,
+        title=body.title.strip(),
+        description=body.description.strip(),
+        keywords=[k.strip() for k in body.keywords if k.strip()],
+        steps=[s.model_dump() for s in body.steps],
+        enabled=int(body.enabled),
+        position=body.position,
+    )
+    db.add(guide)
+    db.flush()
+    write_audit(db, admin, "site_bot.walkthrough_created", "site_bot_walkthrough", guide.id, {"slug": guide.slug, "title": guide.title, "steps": len(guide.steps)})
+    db.commit()
+    return serialize_site_bot_walkthrough(guide)
+
+
+@router.patch("/site-bot/walkthroughs/{guide_id}")
+def update_site_bot_walkthrough(guide_id: str, body: SiteBotWalkthroughPatch, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    guide = db.get(SiteBotWalkthrough, guide_id)
+    if not guide:
+        raise HTTPException(404, "Walkthrough guide not found.")
+    changes = {}
+    if body.slug is not None and body.slug != guide.slug:
+        if db.query(SiteBotWalkthrough).filter(SiteBotWalkthrough.slug == body.slug, SiteBotWalkthrough.id != guide_id).first():
+            raise HTTPException(409, "Another walkthrough already uses that slug.")
+        changes["slug"] = {"from": guide.slug, "to": body.slug}
+        guide.slug = body.slug
+    if body.title is not None:
+        clean_title = body.title.strip()
+        if clean_title != guide.title:
+            changes["title"] = {"from": guide.title, "to": clean_title}
+            guide.title = clean_title
+    if body.description is not None and body.description.strip() != guide.description:
+        changes["description"] = {"changed": True}
+        guide.description = body.description.strip()
+    if body.keywords is not None:
+        cleaned_kw = [k.strip() for k in body.keywords if k.strip()]
+        if list(guide.keywords or []) != cleaned_kw:
+            changes["keywords"] = {"count": len(cleaned_kw)}
+            guide.keywords = cleaned_kw
+    if body.steps is not None:
+        dumped_steps = [s.model_dump() for s in body.steps]
+        changes["steps"] = {"count": len(dumped_steps)}
+        guide.steps = dumped_steps
+    if body.enabled is not None and bool(guide.enabled) != body.enabled:
+        changes["enabled"] = {"from": bool(guide.enabled), "to": body.enabled}
+        guide.enabled = int(body.enabled)
+    if body.position is not None and guide.position != body.position:
+        changes["position"] = {"from": guide.position, "to": body.position}
+        guide.position = body.position
+    if changes:
+        guide.updated_at = now()
+        write_audit(db, admin, "site_bot.walkthrough_updated", "site_bot_walkthrough", guide.id, {"slug": guide.slug, **changes})
+        db.commit()
+    return serialize_site_bot_walkthrough(guide)
+
+
+@router.delete("/site-bot/walkthroughs/{guide_id}")
+def delete_site_bot_walkthrough(guide_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    guide = db.get(SiteBotWalkthrough, guide_id)
+    if not guide:
+        raise HTTPException(404, "Walkthrough guide not found.")
+    write_audit(db, admin, "site_bot.walkthrough_deleted", "site_bot_walkthrough", guide.id, {"slug": guide.slug, "title": guide.title})
+    db.delete(guide)
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/site-bot/conversations")
+def list_site_bot_conversations(
+    q: str = "",
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    ensure_site_bot_seeded(db)
+    query = db.query(SiteBotConversation)
+    if q.strip():
+        needle = "%" + q.strip().replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
+        matching_ids = [
+            r[0]
+            for r in db.query(SiteBotMessage.conversation_id)
+            .filter(SiteBotMessage.content.ilike(needle, escape="\\"))
+            .distinct()
+            .all()
+        ]
+        query = query.filter(
+            or_(
+                SiteBotConversation.visitor_id.ilike(needle, escape="\\"),
+                SiteBotConversation.user_name.ilike(needle, escape="\\"),
+                SiteBotConversation.user_email.ilike(needle, escape="\\"),
+                SiteBotConversation.ip_address.ilike(needle, escape="\\"),
+                SiteBotConversation.device_summary.ilike(needle, escape="\\"),
+                SiteBotConversation.current_page.ilike(needle, escape="\\"),
+                SiteBotConversation.id.in_(matching_ids) if matching_ids else False,
+            )
+        )
+    total = query.count()
+    items = query.order_by(SiteBotConversation.updated_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    rows = []
+    for conv in items:
+        last = db.query(SiteBotMessage).filter_by(conversation_id=conv.id).order_by(SiteBotMessage.created_at.desc()).first()
+        msg_count = db.query(func.count(SiteBotMessage.id)).filter_by(conversation_id=conv.id).scalar() or 0
+        rows.append({
+            "id": conv.id,
+            "visitor_id": conv.visitor_id,
+            "user_id": conv.user_id,
+            "user_name": conv.user_name,
+            "user_email": conv.user_email,
+            "ip_address": conv.ip_address,
+            "device_summary": conv.device_summary,
+            "user_agent": conv.user_agent,
+            "current_page": conv.current_page,
+            "message_count": msg_count,
+            "last_message": last.content[:220] if last else "",
+            "created_at": conv.created_at,
+            "updated_at": conv.updated_at,
+        })
+    return {"items": rows, "total": total, "page": page, "limit": limit}
+
+
+@router.get("/site-bot/conversations/{conv_id}")
+def get_site_bot_conversation_detail(conv_id: str, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    conv = db.get(SiteBotConversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "Website assistant conversation not found.")
+    messages = db.query(SiteBotMessage).filter_by(conversation_id=conv.id).order_by(SiteBotMessage.created_at.asc()).all()
+    return {
+        "conversation": {
+            "id": conv.id,
+            "visitor_id": conv.visitor_id,
+            "user_id": conv.user_id,
+            "user_name": conv.user_name,
+            "user_email": conv.user_email,
+            "ip_address": conv.ip_address,
+            "device_summary": conv.device_summary,
+            "user_agent": conv.user_agent,
+            "current_page": conv.current_page,
+            "created_at": conv.created_at,
+            "updated_at": conv.updated_at,
+        },
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "actions": m.actions or [],
+                "citations": m.citations or [],
+                "page_path": m.page_path,
+                "created_at": m.created_at,
+            }
+            for m in messages
+        ],
+    }
+
+
+class SitePageUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    subtitle: str | None = Field(default=None, max_length=500)
+    content: str | None = Field(default=None, max_length=150000)
+    status: Literal["published", "draft"] | None = None
+
+    @field_validator("title")
+    @classmethod
+    def check_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip()
+        if not clean:
+            raise ValueError("Title cannot be blank.")
+        return clean
+
+
+class FaqItemInput(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    answer: str = Field(min_length=1, max_length=10000)
+    category: str = Field(default="General", min_length=1, max_length=80)
+    position: int = Field(default=0, ge=0, le=9999)
+    published: bool = True
+
+    @field_validator("question", "answer", "category")
+    @classmethod
+    def check_non_blank(cls, value: str) -> str:
+        clean = value.strip()
+        if not clean:
+            raise ValueError("Fields cannot be blank.")
+        return clean
+
+
+class FaqItemPatch(BaseModel):
+    question: str | None = Field(default=None, min_length=1, max_length=500)
+    answer: str | None = Field(default=None, min_length=1, max_length=10000)
+    category: str | None = Field(default=None, min_length=1, max_length=80)
+    position: int | None = Field(default=None, ge=0, le=9999)
+    published: bool | None = None
+
+
+@router.get("/pages")
+def list_admin_pages(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    pages = ensure_site_pages_seeded(db)
+    total_faqs = db.query(func.count(FaqItem.id)).scalar() or 0
+    return {
+        "items": [
+            serialize_site_page(p, faq_count=total_faqs if p.slug == "faqs" else None)
+            for p in pages
+        ]
+    }
+
+
+@router.get("/pages/{slug}")
+def get_admin_page(slug: str, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    ensure_site_pages_seeded(db)
+    page = db.get(SitePage, slug)
+    if not page:
+        raise HTTPException(404, "Page not found.")
+    payload = serialize_site_page(page)
+    if slug == "faqs":
+        faqs = db.query(FaqItem).order_by(FaqItem.position.asc(), FaqItem.created_at.asc()).all()
+        payload["faqs"] = [serialize_faq(f) for f in faqs]
+        payload["faq_count"] = len(faqs)
+    return payload
+
+
+@router.patch("/pages/{slug}")
+def update_admin_page(slug: str, body: SitePageUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    ensure_site_pages_seeded(db)
+    page = db.get(SitePage, slug)
+    if not page:
+        raise HTTPException(404, "Page not found.")
+    changes = {}
+    if body.title is not None and page.title != body.title:
+        changes["title"] = {"from": page.title, "to": body.title}
+        page.title = body.title
+    if body.subtitle is not None and page.subtitle != body.subtitle.strip():
+        changes["subtitle"] = {"changed": True}
+        page.subtitle = body.subtitle.strip()
+    if body.content is not None and page.content != body.content:
+        changes["content"] = {"changed": True}
+        page.content = body.content
+    if body.status is not None and page.status != body.status:
+        changes["status"] = {"from": page.status, "to": body.status}
+        page.status = body.status
+    if changes:
+        page.updated_at = now()
+        write_audit(db, admin, "site_page.updated", "site_page", page.slug, changes)
+        db.commit()
+    return serialize_site_page(page)
+
+
+@router.post("/pages/faqs/items", status_code=201)
+def create_admin_faq(body: FaqItemInput, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    ensure_site_pages_seeded(db)
+    faq = FaqItem(
+        question=body.question,
+        answer=body.answer,
+        category=body.category,
+        position=body.position,
+        published=int(body.published),
+    )
+    db.add(faq)
+    page = db.get(SitePage, "faqs")
+    if page:
+        page.updated_at = now()
+    db.flush()
+    write_audit(db, admin, "faq.created", "faq_item", faq.id, {"question": faq.question[:120], "category": faq.category})
+    db.commit()
+    return serialize_faq(faq)
+
+
+@router.patch("/pages/faqs/items/{faq_id}")
+def update_admin_faq(faq_id: str, body: FaqItemPatch, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    faq = db.get(FaqItem, faq_id)
+    if not faq:
+        raise HTTPException(404, "FAQ item not found.")
+    changes = {}
+    for field in ("question", "answer", "category"):
+        val = getattr(body, field)
+        if val is not None:
+            clean = val.strip()
+            if not clean:
+                raise HTTPException(422, f"{field.capitalize()} cannot be blank.")
+            if getattr(faq, field) != clean:
+                changes[field] = {"changed": True}
+                setattr(faq, field, clean)
+    if body.position is not None and faq.position != body.position:
+        changes["position"] = {"from": faq.position, "to": body.position}
+        faq.position = body.position
+    if body.published is not None and bool(faq.published) != body.published:
+        changes["published"] = {"from": bool(faq.published), "to": body.published}
+        faq.published = int(body.published)
+    if changes:
+        faq.updated_at = now()
+        page = db.get(SitePage, "faqs")
+        if page:
+            page.updated_at = now()
+        write_audit(db, admin, "faq.updated", "faq_item", faq.id, {"question": faq.question[:120], **changes})
+        db.commit()
+    return serialize_faq(faq)
+
+
+@router.delete("/pages/faqs/items/{faq_id}")
+def delete_admin_faq(faq_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    faq = db.get(FaqItem, faq_id)
+    if not faq:
+        raise HTTPException(404, "FAQ item not found.")
+    write_audit(db, admin, "faq.deleted", "faq_item", faq.id, {"question": faq.question[:120], "category": faq.category})
+    db.delete(faq)
+    page = db.get(SitePage, "faqs")
+    if page:
+        page.updated_at = now()
+    db.commit()
+    return {"ok": True}

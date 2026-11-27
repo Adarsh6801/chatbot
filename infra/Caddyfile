@@ -1,0 +1,34 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$WEB_DOMAIN} {
+	encode zstd gzip
+
+	@api path /api/* /widget.js /widget-preview/* /health /docs /openapi.json /redoc
+	handle @api {
+		reverse_proxy api:8000 {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}
+
+{$ADMIN_DOMAIN} {
+	encode zstd gzip
+
+	@api path /api/* /health
+	handle @api {
+		reverse_proxy api:8000 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy admin:3001
+	}
+}
