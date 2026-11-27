@@ -212,7 +212,8 @@ def set_session(response, db, user):
     seconds = int(os.getenv('SESSION_DAYS', '7')) * 86400
     db.add(LoginSession(token_hash=digest(token), user_id=user.id, expires_at=time.time() + seconds))
     db.commit()
-    response.set_cookie('agentforge_session', token, max_age=seconds, httponly=True, secure=PRODUCTION, samesite='lax', path='/')
+    cookie_domain = os.getenv('COOKIE_DOMAIN') or None
+    response.set_cookie('agentforge_session', token, max_age=seconds, httponly=True, secure=PRODUCTION, samesite='lax', path='/', domain=cookie_domain)
 
 def check_document_quota(db, user, extra=1):
     db.execute(update(User).where(User.id == user.id).values(plan=User.plan))
@@ -266,7 +267,7 @@ def logout(request: Request, response: Response, db: DBSession = Depends(get_db)
     token = request.cookies.get('agentforge_session')
     if token: db.query(LoginSession).filter_by(token_hash=digest(token)).delete()
     db.commit()
-    response.delete_cookie('agentforge_session', path='/')
+    response.delete_cookie('agentforge_session', path='/', domain=os.getenv('COOKIE_DOMAIN') or None)
     return {'ok': True}
 
 @app.get('/api/v1/auth/me')
@@ -353,7 +354,7 @@ def delete_account(response: Response, db: DBSession = Depends(get_db), user=Dep
     db.query(AdminAudit).filter_by(actor_id=user.id).delete(synchronize_session=False)
     db.delete(user)
     db.commit()
-    response.delete_cookie('agentforge_session', path='/')
+    response.delete_cookie('agentforge_session', path='/', domain=os.getenv('COOKIE_DOMAIN') or None)
     return {'ok': True}
 
 @app.get('/api/v1/bots')

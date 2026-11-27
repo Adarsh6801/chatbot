@@ -27,14 +27,15 @@ def google_start(request:Request,link:bool=False,admin:bool=False,db=Depends(get
     challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
     params={'client_id':os.environ['GOOGLE_CLIENT_ID'],'redirect_uri':os.getenv('GOOGLE_REDIRECT_URI','http://localhost:8000/api/v1/auth/google/callback'),'response_type':'code','scope':'openid email profile','state':state,'code_challenge':challenge,'code_challenge_method':'S256'}
     response=RedirectResponse('https://accounts.google.com/o/oauth2/v2/auth?'+urlencode(params))
-    response.set_cookie('af_oauth_state',state,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
-    response.set_cookie('af_oauth_verifier',verifier,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
-    if admin: response.set_cookie('af_oauth_admin','1',max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
-    else: response.delete_cookie('af_oauth_admin')
+    cookie_domain=os.getenv('COOKIE_DOMAIN') or None
+    response.set_cookie('af_oauth_state',state,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax',domain=cookie_domain)
+    response.set_cookie('af_oauth_verifier',verifier,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax',domain=cookie_domain)
+    if admin: response.set_cookie('af_oauth_admin','1',max_age=600,httponly=True,secure=PRODUCTION,samesite='lax',domain=cookie_domain)
+    else: response.delete_cookie('af_oauth_admin',domain=cookie_domain)
     if link:
         user=current_user(request,db)
-        response.set_cookie('af_oauth_link',user.id,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
-    else: response.delete_cookie('af_oauth_link')
+        response.set_cookie('af_oauth_link',user.id,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax',domain=cookie_domain)
+    else: response.delete_cookie('af_oauth_link',domain=cookie_domain)
     return response
 
 @router.get('/google/callback')
@@ -75,8 +76,9 @@ async def google_callback(request:Request, code:str='', state:str='', db=Depends
     response=RedirectResponse(os.getenv('ADMIN_WEB_ORIGIN','http://localhost:3001') if admin_login else PUBLIC_WEB_URL + '/agents')
     from .main import set_session
     set_session(response,db,user)
-    response.delete_cookie('af_oauth_state')
-    response.delete_cookie('af_oauth_verifier')
-    response.delete_cookie('af_oauth_link')
-    response.delete_cookie('af_oauth_admin')
+    cookie_domain=os.getenv('COOKIE_DOMAIN') or None
+    response.delete_cookie('af_oauth_state',domain=cookie_domain)
+    response.delete_cookie('af_oauth_verifier',domain=cookie_domain)
+    response.delete_cookie('af_oauth_link',domain=cookie_domain)
+    response.delete_cookie('af_oauth_admin',domain=cookie_domain)
     return response
