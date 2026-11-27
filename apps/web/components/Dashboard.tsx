@@ -220,17 +220,29 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
       setBusy(false);
     }
   }
+  function clearWorkspaceSession() {
+    agentPageCache.clear();
+    setUser(null);
+    onAuthenticationChange?.(false);
+    setBots([]);
+    setUsage(null);
+    setSelected(null);
+    setSection("agents");
+    router.push("/agents");
+    setAccountMenu(false);
+  }
   async function logout() {
+    const accepted = await confirmDialog({
+      title: "Log out?",
+      description: "Are you sure you want to log out of your account?",
+      confirmText: "Log out",
+      tone: "danger",
+    });
+    if (!accepted) return;
     setError("");
     try {
       await api("/auth/logout", { method: "POST" });
-      setUser(null);
-      onAuthenticationChange?.(false);
-      setBots([]);
-      setSelected(null);
-      setSection("agents");
-      router.push("/agents");
-      setAccountMenu(false);
+      clearWorkspaceSession();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -267,7 +279,7 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
         <Flame /> <span>Opening your workspace…</span>
       </div>
     );
-  if (!user) return <AuthGate onUser={(next) => { setUser(next); onAuthenticationChange?.(true); }} />;
+  if (!user) return <AuthGate />;
   const filtered = bots.filter((b) =>
     (b.name + " " + b.description).toLowerCase().includes(query.toLowerCase()),
   );
@@ -750,9 +762,11 @@ export default function Dashboard({ onAuthenticationChange }: { onAuthentication
             <AccountProfile
               user={user}
               usage={usage}
+              bots={bots}
               onUpdate={setUser}
               onSubscribe={() => navigateSection("billing")}
               onLogout={logout}
+              onDeleted={clearWorkspaceSession}
               notify={setToast}
             />
           ) : section === "billing" ? (

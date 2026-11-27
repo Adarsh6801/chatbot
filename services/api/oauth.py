@@ -19,7 +19,7 @@ def config():
     return {'google_enabled':bool(os.getenv('GOOGLE_CLIENT_ID') and os.getenv('GOOGLE_CLIENT_SECRET'))}
 
 @router.get('/google/start')
-def google_start(request:Request,link:bool=False,db=Depends(get_db)):
+def google_start(request:Request,link:bool=False,admin:bool=False,db=Depends(get_db)):
     if not os.getenv('GOOGLE_CLIENT_ID') or not os.getenv('GOOGLE_CLIENT_SECRET'): raise HTTPException(503,'Google sign-in is not configured.')
     state=secrets.token_urlsafe(32)
     verifier=secrets.token_urlsafe(48)
@@ -29,6 +29,8 @@ def google_start(request:Request,link:bool=False,db=Depends(get_db)):
     response=RedirectResponse('https://accounts.google.com/o/oauth2/v2/auth?'+urlencode(params))
     response.set_cookie('af_oauth_state',state,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
     response.set_cookie('af_oauth_verifier',verifier,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
+    if admin: response.set_cookie('af_oauth_admin','1',max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
+    else: response.delete_cookie('af_oauth_admin')
     if link:
         user=current_user(request,db)
         response.set_cookie('af_oauth_link',user.id,max_age=600,httponly=True,secure=PRODUCTION,samesite='lax')
@@ -69,10 +71,12 @@ async def google_callback(request:Request, code:str='', state:str='', db=Depends
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'That Google account is already connected. Please sign in again.')
-    response=RedirectResponse(PUBLIC_WEB_URL + '/agents')
+    admin_login=request.cookies.get('af_oauth_admin')=='1'
+    response=RedirectResponse(os.getenv('ADMIN_WEB_ORIGIN','http://localhost:3001') if admin_login else PUBLIC_WEB_URL + '/agents')
     from .main import set_session
     set_session(response,db,user)
     response.delete_cookie('af_oauth_state')
     response.delete_cookie('af_oauth_verifier')
     response.delete_cookie('af_oauth_link')
+    response.delete_cookie('af_oauth_admin')
     return response

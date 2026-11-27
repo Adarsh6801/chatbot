@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, Bot, Conversation, Document, DocumentationCategory, DocumentationPage, LoginSession, Message, Payment, SupportTicket, SupportTicketMessage, User, get_db, now, uid
+from .database import AdminAudit, AgentVersion, ApiKey, AppSetting, BillingAttempt, Bot, BotActivityLog, Chunk, Conversation, Document, DocumentationCategory, DocumentationPage, Flag, LoginSession, Message, Payment, SupportTicket, SupportTicketMessage, TokenUsage, User, Workflow, get_db, now, uid
 from .payment_settings import get_payment_provider, payment_provider_status
 from .security import current_user
 from .providers import store_site_logo, read_site_logo
@@ -33,6 +33,44 @@ def write_audit(db: Session, actor: User, action: str, entity_type: str, entity_
 class UserUpdate(BaseModel):
     plan: str | None = None
     is_active: bool | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    company: str | None = Field(default=None, max_length=120)
+    bio: str | None = Field(default=None, max_length=500)
+    avatar_url: str | None = Field(default=None, max_length=2000)
+    subscription_tokens: int | None = Field(default=None, ge=0, le=100_000_000_000)
+    topup_tokens: int | None = Field(default=None, ge=0, le=100_000_000_000)
+
+    @field_validator('name')
+    @classmethod
+    def clean_user_name(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError('Name cannot be blank.')
+        return value.strip() if value is not None else None
+
+    @field_validator('avatar_url')
+    @classmethod
+    def valid_avatar_url(cls, value):
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if cleaned and not cleaned.startswith('https://'):
+            raise ValueError('Profile image URL must use HTTPS.')
+        return cleaned
+
+
+class UserAgentUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    description: str | None = Field(default=None, max_length=500)
+    system_prompt: str | None = Field(default=None, max_length=3000)
+    threshold: float | None = Field(default=None, ge=0.05, le=0.95)
+    published: bool | None = None
+
+    @field_validator('name')
+    @classmethod
+    def clean_agent_name(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError('Agent name cannot be blank.')
+        return value.strip() if value is not None else None
 
 
 class AgentUpdate(BaseModel):
@@ -701,9 +739,124 @@ def users(q: str = "", page: int = 1, limit: int = 25, db: Session = Depends(get
             "is_active": bool(account.is_active), "created_at": account.created_at,
             "agent_count": db.query(func.count(Bot.id)).filter(Bot.user_id == account.id).scalar() or 0,
             "message_count": db.query(func.count(Message.id)).join(Bot, Message.bot_id == Bot.id).filter(Bot.user_id == account.id, Message.role == "user").scalar() or 0,
-            "has_subscription": bool(account.subscription_id),
+            "has_subscription": bool(account.subscription_id or account.razorpay_subscription_id),
         })
     return {"items": items, "total": total, "page": page, "limit": limit, "plan_options": [{'slug': p['slug'], 'name': p['name']} for p in get_plan_catalog(db)]}
+
+
+@router.get("/users/{user_id}")
+def user_detail(user_id: str, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "Account not found.")
+    admin_id = os.getenv("ADMIN_USER_ID", "").strip()
+    bots = db.query(Bot).filter_by(user_id=target.id).order_by(Bot.created_at.desc()).all()
+    bot_ids = [b.id for b in bots]
+    bot_names = {b.id: b.name for b in bots}
+    active_sessions = db.query(func.count(LoginSession.token_hash)).filter(LoginSession.user_id == target.id).scalar() or 0
+    api_keys = db.query(ApiKey).filter_by(user_id=target.id).order_by(ApiKey.created_at.desc()).all()
+    tickets = db.query(SupportTicket).filter_by(user_id=target.id).order_by(SupportTicket.updated_at.desc()).all()
+    ticket_ids = [t.id for t in tickets]
+
+    agent_items = []
+    for bot in bots:
+        wf = db.query(Workflow).filter_by(bot_id=bot.id).first()
+        doc_count = db.query(func.count(Document.id)).filter(Document.bot_id == bot.id).scalar() or 0
+        ready_docs = db.query(func.count(Document.id)).filter(Document.bot_id == bot.id, Document.status == "READY").scalar() or 0
+        failed_docs = db.query(func.count(Document.id)).filter(Document.bot_id == bot.id, Document.status == "FAILED").scalar() or 0
+        chunk_count = db.query(func.count(Chunk.id)).filter(Chunk.bot_id == bot.id).scalar() or 0
+        conv_count = db.query(func.count(Conversation.id)).filter(Conversation.bot_id == bot.id).scalar() or 0
+        msg_count = db.query(func.count(Message.id)).filter(Message.bot_id == bot.id, Message.role == "user").scalar() or 0
+        flag_count = db.query(func.count(Flag.id)).filter(Flag.bot_id == bot.id, Flag.status == "open").scalar() or 0
+        agent_items.append({
+            "id": bot.id, "name": bot.name, "slug": bot.slug, "public_key": bot.public_key,
+            "description": bot.description or "", "system_prompt": bot.system_prompt or "",
+            "threshold": bot.threshold, "published": bool(bot.published),
+            "widget_config": bot.widget_config or {}, "created_at": bot.created_at,
+            "documents": doc_count, "ready_documents": ready_docs, "failed_documents": failed_docs,
+            "chunks": chunk_count, "conversations": conv_count, "messages": msg_count, "open_flags": flag_count,
+            "has_workflow": bool(wf), "workflow_enabled": bool(wf and wf.enabled), "workflow_version": wf.version if wf else 0,
+        })
+
+    attempts = db.query(BillingAttempt).filter_by(user_id=target.id).order_by(BillingAttempt.created_at.desc()).limit(50).all()
+    payments = db.query(Payment).filter_by(user_id=target.id).order_by(Payment.created_at.desc()).limit(50).all()
+    usage_rows = db.query(TokenUsage).filter_by(user_id=target.id).order_by(TokenUsage.created_at.desc()).limit(50).all()
+
+    conv_items = []
+    if bot_ids:
+        convs = db.query(Conversation).filter(Conversation.bot_id.in_(bot_ids)).order_by(Conversation.created_at.desc()).limit(50).all()
+        for conv in convs:
+            last = db.query(Message).filter_by(conversation_id=conv.id).order_by(Message.created_at.desc()).first()
+            conv_items.append({
+                "id": conv.id, "agent_id": conv.bot_id, "agent_name": bot_names.get(conv.bot_id, "Agent"),
+                "visitor_id": conv.visitor_id, "user_id": conv.user_id, "user_name": conv.user_name,
+                "created_at": conv.created_at,
+                "last_message_at": last.created_at if last else conv.created_at,
+                "last_message": last.content[:240] if last else "",
+                "message_count": db.query(func.count(Message.id)).filter_by(conversation_id=conv.id).scalar() or 0,
+            })
+
+    entity_ids = [target.id, *bot_ids, *ticket_ids]
+    audit_rows = (
+        db.query(AdminAudit, User)
+        .join(User, AdminAudit.actor_id == User.id)
+        .filter(AdminAudit.entity_id.in_(entity_ids) | (AdminAudit.actor_id == target.id))
+        .order_by(AdminAudit.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    bot_logs = (
+        db.query(BotActivityLog)
+        .filter(BotActivityLog.bot_id.in_(bot_ids))
+        .order_by(BotActivityLog.created_at.desc())
+        .limit(100)
+        .all()
+    ) if bot_ids else []
+
+    return {
+        "user": {
+            "id": target.id, "name": target.name, "email": target.email,
+            "plan": target.plan, "is_active": bool(target.is_active),
+            "is_admin": bool(admin_id and target.id == admin_id),
+            "company": target.company or "", "bio": target.bio or "",
+            "avatar_url": target.avatar_url or "", "google_connected": bool(target.google_sub),
+            "billing_provider": target.billing_provider,
+            "stripe_customer_id": target.stripe_customer_id, "subscription_id": target.subscription_id,
+            "razorpay_subscription_id": target.razorpay_subscription_id,
+            "has_subscription": bool(target.subscription_id or target.razorpay_subscription_id),
+            "free_started_at": target.free_started_at, "free_trial_used": bool(target.free_trial_used),
+            "subscription_tokens": target.subscription_tokens, "topup_tokens": target.topup_tokens,
+            "created_at": target.created_at,
+            "active_session_count": active_sessions,
+            "api_key_count": len(api_keys),
+            "ticket_count": len(tickets),
+            "agent_count": len(bots),
+            "published_agent_count": sum(1 for b in bots if b.published),
+            "document_count": sum(a["documents"] for a in agent_items),
+            "conversation_count": sum(a["conversations"] for a in agent_items),
+            "message_count": sum(a["messages"] for a in agent_items),
+        },
+        "plan_options": [{"slug": p["slug"], "name": p["name"], "tokens": p.get("tokens", 0)} for p in get_plan_catalog(db)],
+        "agents": agent_items,
+        "subscription": {
+            "plan": target.plan, "billing_provider": target.billing_provider,
+            "has_subscription": bool(target.subscription_id or target.razorpay_subscription_id),
+            "stripe_customer_id": target.stripe_customer_id, "subscription_id": target.subscription_id,
+            "razorpay_subscription_id": target.razorpay_subscription_id,
+            "free_started_at": target.free_started_at, "free_trial_used": bool(target.free_trial_used),
+            "subscription_tokens": target.subscription_tokens, "topup_tokens": target.topup_tokens,
+            "attempts": [{"id": a.id, "provider": a.provider, "provider_reference": a.provider_reference, "plan": a.plan, "status": a.status, "paid_count": a.paid_count, "amount": a.amount, "currency": a.currency, "created_at": a.created_at, "updated_at": a.updated_at} for a in attempts],
+            "payments": [{"id": p.id, "provider": p.provider, "kind": p.kind, "plan": p.plan, "tokens": p.tokens, "amount": p.amount, "currency": p.currency, "status": p.status, "created_at": p.created_at} for p in payments],
+            "token_usage": [{"id": u.id, "tokens": u.tokens, "subscription_tokens": u.subscription_tokens, "topup_tokens": u.topup_tokens, "source": u.source, "created_at": u.created_at} for u in usage_rows],
+        },
+        "conversations": conv_items,
+        "api_keys": [{"id": k.id, "name": k.name, "prefix": k.prefix, "created_at": k.created_at} for k in api_keys],
+        "tickets": [support_ticket_item(db, t, target) for t in tickets],
+        "logs": {
+            "admin_audit": [{"id": e.id, "action": e.action, "entity_type": e.entity_type, "entity_id": e.entity_id, "details": e.details or {}, "created_at": e.created_at, "actor_email": actor.email} for e, actor in audit_rows],
+            "bot_activity": [{"id": l.id, "bot_id": l.bot_id, "bot_name": bot_names.get(l.bot_id, "Agent"), "conversation_id": l.conversation_id, "source": l.source, "event_type": l.event_type, "severity": l.severity, "title": l.title, "details": l.details or {}, "created_at": l.created_at} for l in bot_logs],
+        },
+    }
 
 
 @router.patch("/users/{user_id}")
@@ -712,8 +865,9 @@ def update_user(user_id: str, body: UserUpdate, db: Session = Depends(get_db), a
     if not target:
         raise HTTPException(404, "Account not found.")
     changes = {}
+    catalog = get_plan_catalog(db)
     if body.plan is not None:
-        if body.plan not in {p['slug'] for p in get_plan_catalog(db)}:
+        if body.plan not in {p['slug'] for p in catalog}:
             raise HTTPException(422, "Choose a valid plan.")
         if target.plan != body.plan:
             changes["plan"] = {"from": target.plan, "to": body.plan}
@@ -721,9 +875,23 @@ def update_user(user_id: str, body: UserUpdate, db: Session = Depends(get_db), a
             if body.plan == 'free':
                 target.free_started_at = None
                 target.free_trial_used = 1
-                target.subscription_tokens = next(p['tokens'] for p in get_plan_catalog(db) if p['slug'] == 'free')
+                target.subscription_tokens = next(p['tokens'] for p in catalog if p['slug'] == 'free')
             else:
-                target.subscription_tokens = next(p['tokens'] for p in get_plan_catalog(db) if p['slug'] == body.plan)
+                target.subscription_tokens = next(p['tokens'] for p in catalog if p['slug'] == body.plan)
+    if body.subscription_tokens is not None and target.subscription_tokens != body.subscription_tokens:
+        changes["subscription_tokens"] = {"from": target.subscription_tokens, "to": body.subscription_tokens}
+        target.subscription_tokens = body.subscription_tokens
+    if body.topup_tokens is not None and target.topup_tokens != body.topup_tokens:
+        changes["topup_tokens"] = {"from": target.topup_tokens, "to": body.topup_tokens}
+        target.topup_tokens = body.topup_tokens
+    for field in ("name", "company", "bio", "avatar_url"):
+        val = getattr(body, field)
+        if val is not None:
+            current_val = getattr(target, field) or ""
+            next_val = val.strip() if field in ("company", "bio") else val
+            if current_val != next_val:
+                changes[field] = {"from": current_val, "to": next_val}
+                setattr(target, field, next_val)
     if body.is_active is not None:
         desired = int(body.is_active)
         if not desired and target.id == admin.id:
@@ -737,7 +905,78 @@ def update_user(user_id: str, body: UserUpdate, db: Session = Depends(get_db), a
     if changes:
         write_audit(db, admin, "user.updated", "user", target.id, {"email": target.email, **changes})
         db.commit()
-    return {"ok": True, "user": {"id": target.id, "plan": target.plan, "is_active": bool(target.is_active)}}
+    return {"ok": True, "user": {"id": target.id, "name": target.name, "plan": target.plan, "is_active": bool(target.is_active), "subscription_tokens": target.subscription_tokens, "topup_tokens": target.topup_tokens}}
+
+
+def _set_agent_published(db: Session, bot: Bot, actor_id: str, published: bool) -> None:
+    if published:
+        widget = dict(bot.widget_config or {})
+        for key, value in {'color': '#d6ff63', 'position': 'right', 'greeting': 'Hi! What can I help you find?', 'logo': '', 'launcher_icon': 'sparkle'}.items():
+            widget.setdefault(key, value)
+        snapshot = {'name': bot.name, 'description': bot.description or '', 'system_prompt': bot.system_prompt or '', 'threshold': bot.threshold, 'widget_config': widget}
+        has_major = db.query(AgentVersion).filter_by(bot_id=bot.id, kind='major').count() > 0
+        if not has_major or bot.published_config != snapshot:
+            major = db.query(func.max(AgentVersion.major)).filter_by(bot_id=bot.id, kind='major').scalar() or 0
+            db.add(AgentVersion(bot_id=bot.id, created_by=actor_id, major=major + 1, minor=0, kind='major', snapshot=snapshot))
+            bot.published_config = snapshot
+    bot.published = int(published)
+
+
+@router.patch("/users/{user_id}/agents/{bot_id}")
+def update_user_agent(user_id: str, bot_id: str, body: UserAgentUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "Account not found.")
+    bot = db.query(Bot).filter_by(id=bot_id, user_id=user_id).first()
+    if not bot:
+        raise HTTPException(404, "Agent not found for this user.")
+    changes = {}
+    if body.name is not None and bot.name != body.name:
+        changes["name"] = {"from": bot.name, "to": body.name}
+        bot.name = body.name
+    if body.description is not None and (bot.description or "") != body.description:
+        changes["description"] = {"from": bot.description or "", "to": body.description}
+        bot.description = body.description
+    if body.system_prompt is not None and (bot.system_prompt or "") != body.system_prompt:
+        changes["system_prompt"] = {"changed": True}
+        bot.system_prompt = body.system_prompt
+    if body.threshold is not None and abs(float(bot.threshold) - float(body.threshold)) > 1e-9:
+        changes["threshold"] = {"from": bot.threshold, "to": body.threshold}
+        bot.threshold = body.threshold
+    if body.published is not None and bool(bot.published) != body.published:
+        changes["published"] = {"from": bool(bot.published), "to": body.published}
+        _set_agent_published(db, bot, admin.id, body.published)
+    if changes:
+        write_audit(db, admin, "agent.updated", "agent", bot.id, {"name": bot.name, "owner_email": target.email, **changes})
+        db.commit()
+    return {"ok": True, "id": bot.id, "published": bool(bot.published)}
+
+
+@router.delete("/users/{user_id}/keys/{key_id}")
+def revoke_user_key(user_id: str, key_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "Account not found.")
+    key = db.query(ApiKey).filter_by(id=key_id, user_id=user_id).first()
+    if not key:
+        raise HTTPException(404, "API key not found.")
+    write_audit(db, admin, "user.api_key_revoked", "user", target.id, {"email": target.email, "key_id": key.id, "name": key.name, "prefix": key.prefix})
+    db.delete(key)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/users/{user_id}/sessions/revoke")
+def revoke_user_sessions(user_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "Account not found.")
+    if target.id == admin.id:
+        raise HTTPException(422, "You cannot revoke your own active administrator sessions here.")
+    count = db.query(LoginSession).filter_by(user_id=target.id).delete(synchronize_session=False)
+    write_audit(db, admin, "user.sessions_revoked", "user", target.id, {"email": target.email, "revoked_count": count})
+    db.commit()
+    return {"ok": True, "revoked_count": count}
 
 
 @router.get("/agents")
@@ -767,16 +1006,7 @@ def update_agent(bot_id: str, body: AgentUpdate, db: Session = Depends(get_db), 
         raise HTTPException(404, "Agent not found.")
     if bool(bot.published) != body.published:
         owner = db.get(User, bot.user_id)
-        if body.published:
-            widget = dict(bot.widget_config or {})
-            for key,value in {'color':'#d6ff63','position':'right','greeting':'Hi! What can I help you find?','logo':'','launcher_icon':'sparkle'}.items(): widget.setdefault(key,value)
-            snapshot = {'name':bot.name,'description':bot.description or '','system_prompt':bot.system_prompt or '','threshold':bot.threshold,'widget_config':widget}
-            has_major = db.query(AgentVersion).filter_by(bot_id=bot.id,kind='major').count() > 0
-            if not has_major or bot.published_config != snapshot:
-                major = db.query(func.max(AgentVersion.major)).filter_by(bot_id=bot.id,kind='major').scalar() or 0
-                db.add(AgentVersion(bot_id=bot.id,created_by=admin.id,major=major+1,minor=0,kind='major',snapshot=snapshot))
-                bot.published_config = snapshot
-        bot.published = int(body.published)
+        _set_agent_published(db, bot, admin.id, body.published)
         write_audit(db, admin, "agent.published" if body.published else "agent.unpublished", "agent", bot.id,
                     {"name": bot.name, "owner_email": owner.email if owner else None})
         db.commit()

@@ -170,8 +170,146 @@ def test_google_registration_creates_profile_and_session(client,monkeypatch):
     assert google_callback(client).status_code==307
     with Session() as db: assert db.query(User).count()==1
 
+def test_google_admin_signin_redirects_to_admin_origin(client,monkeypatch):
+    mock_google(monkeypatch)
+    monkeypatch.setenv('ADMIN_WEB_ORIGIN','https://admin.example.test')
+    start=client.get('/api/v1/auth/google/start?admin=true',follow_redirects=False)
+    state=parse_qs(urlparse(start.headers['location']).query)['state'][0]
+    response=client.get('/api/v1/auth/google/callback',params={'state':state,'code':'test-code'},follow_redirects=False)
+    assert response.headers['location']=='https://admin.example.test'
+
 def test_google_link_keeps_existing_workspace_identity(owner,monkeypatch):
     before=owner.get('/api/v1/auth/me').json();mock_google(monkeypatch,email='different-google@example.com')
     assert google_callback(owner,link=True).status_code==307
     after=owner.get('/api/v1/auth/me').json()
     assert after['id']==before['id'] and after['email']==before['email'] and after['google_connected']
+
+def test_account_deletion_summary_and_permanent_delete(owner,bot,monkeypatch):
+    from services.api.database import ApiKey, Bot, LoginSession, SupportTicket
+    source(owner,bot)
+    assert owner.patch('/api/v1/bots/'+bot['id'],json={'published':True}).status_code==200
+    assert events(ask(owner,bot))[-1][0]=='done'
+    key=owner.post('/api/v1/account/keys',json={'name':'Personal'}).json()
+    ticket=owner.post('/api/v1/support/tickets',json={'subject':'Help me','message':'Testing delete'}).json()
+    assert ticket['id']
+
+    me=owner.get('/api/v1/auth/me').json()
+    with Session() as db:
+        u=db.get(User,me['id'])
+        u.plan='pro';u.billing_provider='stripe';u.stripe_customer_id='cus_del';u.subscription_id='sub_del'
+        db.commit()
+    second=owner.post('/api/v1/bots',json={'name':'Draft Bot'})
+    assert second.status_code==201
+
+    summary=owner.get('/api/v1/account/deletion-summary')
+    assert summary.status_code==200
+    data=summary.json()
+    assert data['has_active_subscription'] is True
+    assert data['has_paid_plan'] is True
+    assert data['plan']=='pro'
+    assert data['total_bots']==2
+    assert data['published_bots']==1
+    assert data['draft_bots']==1
+
+    cancelled=[]
+    import stripe
+    monkeypatch.setenv('STRIPE_SECRET_KEY','sk_test_dummy')
+    monkeypatch.setattr(stripe.Subscription,'cancel',lambda sid: cancelled.append(sid))
+
+    assert owner.delete('/api/v1/account',headers={'origin':'https://evil.example'}).status_code==403
+    deleted=owner.delete('/api/v1/account')
+    assert deleted.status_code==200 and deleted.json()['ok'] is True
+    assert cancelled==['sub_del']
+    assert owner.get('/api/v1/auth/me').status_code==401
+    assert owner.get('/api/v1/public/bots/'+bot['slug']).status_code==404
+    assert owner.get('/api/v1/bots',headers={'Authorization':'Bearer '+key['key']}).status_code==401
+    with Session() as db:
+        assert db.get(User,me['id']) is None
+        assert db.query(Bot).filter_by(user_id=me['id']).count()==0
+        assert db.query(LoginSession).filter_by(user_id=me['id']).count()==0
+        assert db.query(ApiKey).filter_by(user_id=me['id']).count()==0
+        assert db.query(SupportTicket).filter_by(user_id=me['id']).count()==0
+
+
+def test_admin_user_view_and_edits_audit_logged(client,owner,bot,monkeypatch):
+    from fastapi.testclient import TestClient
+    from services.api.database import BillingAttempt,BotActivityLog,Payment,TokenUsage
+    source(owner,bot)
+    assert owner.patch('/api/v1/bots/'+bot['id'],json={'published':True}).status_code==200
+    assert events(ask(owner,bot))[-1][0]=='done'
+    key=owner.post('/api/v1/account/keys',json={'name':'Deploy Key'}).json()
+    ticket=owner.post('/api/v1/support/tickets',json={'subject':'Billing help','message':'Need invoice details'}).json()
+    me=owner.get('/api/v1/auth/me').json()
+
+    assert owner.get('/api/v1/admin/users/'+me['id']).status_code==403
+
+    admin_client=TestClient(client.app)
+    admin_client.headers['X-AgentForge-Client']='dashboard'
+    reg=admin_client.post('/api/v1/auth/register',json={'name':'Platform Admin','email':'admin-ops@example.com','password':'AdminPassword123!'})
+    assert reg.status_code in (200,201),reg.text
+    admin_me=admin_client.get('/api/v1/auth/me').json()
+    monkeypatch.setenv('ADMIN_USER_ID',admin_me['id'])
+
+    with Session() as db:
+        u=db.get(User,me['id'])
+        u.billing_provider='razorpay'
+        u.razorpay_subscription_id='sub_rzp_test_1'
+        db.add(BillingAttempt(user_id=me['id'],provider='razorpay',provider_reference='sub_rzp_test_1',plan='pro',status='active',paid_count=1,amount=2900,currency='USD'))
+        db.add(Payment(id='pay_rzp_1',user_id=me['id'],provider='razorpay',kind='subscription',plan='pro',tokens=10000,amount=2900,currency='USD',status='paid'))
+        db.add(TokenUsage(user_id=me['id'],tokens=42,subscription_tokens=42,topup_tokens=0,source='chat'))
+        db.add(BotActivityLog(bot_id=bot['id'],source='chat',event_type='response_sent',severity='info',title='Answered test question',details={'ok':True}))
+        db.commit()
+
+    users_list=admin_client.get('/api/v1/admin/users',params={'q':me['email']})
+    assert users_list.status_code==200
+    listed=next(item for item in users_list.json()['items'] if item['id']==me['id'])
+    assert listed['has_subscription'] is True
+
+    detail=admin_client.get('/api/v1/admin/users/'+me['id'])
+    assert detail.status_code==200,detail.text
+    payload=detail.json()
+    assert payload['user']['email']==me['email']
+    assert payload['user']['has_subscription'] is True
+    assert payload['user']['active_session_count']>=1
+    assert len(payload['agents'])==1 and payload['agents'][0]['id']==bot['id']
+    assert len(payload['subscription']['attempts'])==1
+    assert len(payload['subscription']['payments'])==1
+    assert any(u['tokens']==42 for u in payload['subscription']['token_usage'])
+    assert len(payload['conversations'])==1
+    assert len(payload['api_keys'])==1 and payload['api_keys'][0]['id']==key['id']
+    assert len(payload['tickets'])==1 and payload['tickets'][0]['id']==ticket['id']
+    assert len(payload['logs']['bot_activity'])>=1
+
+    assert admin_client.patch('/api/v1/admin/users/'+admin_me['id'],json={'is_active':False}).status_code==422
+    assert admin_client.post('/api/v1/admin/users/'+admin_me['id']+'/sessions/revoke').status_code==422
+
+    edited_user=admin_client.patch('/api/v1/admin/users/'+me['id'],json={'name':'Updated Owner','company':'Acme AI','plan':'pro','subscription_tokens':15000,'topup_tokens':500})
+    assert edited_user.status_code==200,edited_user.text
+    assert edited_user.json()['user']['plan']=='pro'
+    assert edited_user.json()['user']['subscription_tokens']==15000
+
+    edited_agent=admin_client.patch(f"/api/v1/admin/users/{me['id']}/agents/{bot['id']}",json={'name':'Renamed Agent','description':'Updated desc','threshold':0.42,'published':False})
+    assert edited_agent.status_code==200,edited_agent.text
+    assert edited_agent.json()['id']==bot['id']
+    assert edited_agent.json()['published'] is False
+
+    assert admin_client.delete(f"/api/v1/admin/users/{me['id']}/keys/{key['id']}").status_code==200
+    assert admin_client.post(f"/api/v1/admin/users/{me['id']}/sessions/revoke").status_code==200
+    assert owner.get('/api/v1/auth/me').status_code==401
+
+    assert admin_client.patch('/api/v1/admin/users/'+me['id'],json={'is_active':False}).status_code==200
+    assert admin_client.patch('/api/v1/admin/users/'+me['id'],json={'is_active':True}).status_code==200
+
+    refreshed=admin_client.get('/api/v1/admin/users/'+me['id']).json()
+    assert refreshed['user']['name']=='Updated Owner'
+    assert refreshed['user']['company']=='Acme AI'
+    assert refreshed['user']['topup_tokens']==500
+    assert refreshed['user']['is_active'] is True
+    assert refreshed['agents'][0]['name']=='Renamed Agent'
+    assert refreshed['agents'][0]['description']=='Updated desc'
+    assert abs(refreshed['agents'][0]['threshold']-0.42)<1e-6
+    assert refreshed['agents'][0]['published'] is False
+    assert refreshed['api_keys']==[]
+    actions=[entry['action'] for entry in refreshed['logs']['admin_audit']]
+    for expected in ('user.updated','agent.updated','user.api_key_revoked','user.sessions_revoked'):
+        assert expected in actions

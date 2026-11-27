@@ -3,11 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
-import { Activity, Bot, BookOpen, ChevronLeft, ChevronRight, CircleHelp, CreditCard, LayoutDashboard, LogOut, MessageSquareText, RefreshCw, Search, Shield, ShieldAlert, Users, X, Settings2, Upload, Image as ImageIcon, Sparkles, Zap } from "lucide-react";
-import { api } from "@/lib/api";
+import { Activity, Bot, BookOpen, ChevronLeft, ChevronRight, CircleHelp, CreditCard, Eye, LayoutDashboard, LogOut, MessageSquareText, RefreshCw, Search, Shield, ShieldAlert, Users, X, Settings2, Upload, Image as ImageIcon, Sparkles, Zap } from "lucide-react";
+import { api, API } from "@/lib/api";
 import type { AdminAgent, AdminUser, AuditEvent } from "@/lib/api";
 import { SupportEditor, SupportMessageView } from "./SupportRichText";
 import DocumentationAdmin from "./DocumentationAdmin";
+import UserDetailModal from "./UserDetailModal";
 import "./payments.css";
 import "./langfuse.css";
 
@@ -36,6 +37,7 @@ async function cropSiteLogo(file: File): Promise<Blob> {
 export default function AdminConsole() {
   const [admin, setAdmin] = useState<Admin | null>(null);
   const [checking, setChecking] = useState(true);
+  const [google, setGoogle] = useState<boolean|null>(null);
   const [denied, setDenied] = useState(false);
   const [view, setView] = useState<View>("overview");
   const [overview, setOverview] = useState<any>(null);
@@ -61,6 +63,7 @@ export default function AdminConsole() {
   const [busy, setBusy] = useState(false);
   const [transcript, setTranscript] = useState<{ title: string; messages: any[] } | null>(null);
   const [supportThread, setSupportThread] = useState<any>(null);
+  const [viewedUserId, setViewedUserId] = useState<string | null>(null);
   const [supportReply, setSupportReply] = useState("");
   const [supportUnread, setSupportUnread] = useState(0);
   const [ticketNotice, setTicketNotice] = useState("");
@@ -93,6 +96,7 @@ export default function AdminConsole() {
     api<{name:string;logo_url:string}>('/public/site-settings').then(branding=>{
       setSiteName(branding.name);setSiteSettings(current=>({...current,name:branding.name,logo_url:branding.logo_url,has_logo:!!branding.logo_url}));
     }).catch(() => {});
+    api<{google_enabled:boolean}>('/auth/config').then(config=>setGoogle(config.google_enabled)).catch(()=>setGoogle(false));
     api<Admin>("/auth/me").then((me) => {
       if (me.is_admin) setAdmin(me);
       else { setDenied(true); api("/auth/logout", { method: "POST" }).catch(() => {}); }
@@ -146,20 +150,6 @@ export default function AdminConsole() {
     }, 10000);
     return () => window.clearInterval(timer);
   }, [admin, view, supportThread?.id]);
-
-  async function login(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setLoginError("");
-    const form = new FormData(event.currentTarget);
-    try {
-      const me = await api<Admin>("/auth/login", { method: "POST", body: JSON.stringify({ email: form.get("email"), password: form.get("password") }) });
-      if (!me.is_admin) {
-        await api("/auth/logout", { method: "POST" });
-        setDenied(true); setLoginError("This account does not have global administrator access."); return;
-      }
-      setAdmin(me);
-    } catch (e) { setLoginError((e as Error).message); }
-    finally { setBusy(false); }
-  }
 
   async function logout() {
     try { await api("/auth/logout", { method: "POST" }); } finally { setAdmin(null); setOverview(null); setRows(null); setView("overview"); }
@@ -226,7 +216,7 @@ export default function AdminConsole() {
       await api(`/admin/support/tickets/${id}/read`, { method: "POST" });
       setSupportThread(await api(`/admin/support/tickets/${id}`));
       setSupportReply("");
-      await refreshRows("tickets", page, submittedQuery);
+      if (view === "tickets") await refreshRows("tickets", page, submittedQuery);
     } catch (e) { setError((e as Error).message); }
   }
 
@@ -238,7 +228,7 @@ export default function AdminConsole() {
       await api(`/admin/support/tickets/${supportThread.id}/messages`, { method: "POST", body: JSON.stringify({ message: supportReply }) });
       setSupportReply("");
       setSupportThread(await api(`/admin/support/tickets/${supportThread.id}`));
-      await refreshRows("tickets", page, submittedQuery);
+      if (view === "tickets") await refreshRows("tickets", page, submittedQuery);
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   }
@@ -249,13 +239,13 @@ export default function AdminConsole() {
     try {
       await api(`/admin/support/tickets/${supportThread.id}`, { method: "PATCH", body: JSON.stringify({ status }) });
       setSupportThread(await api(`/admin/support/tickets/${supportThread.id}`));
-      await refreshRows("tickets", page, submittedQuery);
+      if (view === "tickets") await refreshRows("tickets", page, submittedQuery);
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   }
 
   if (checking) return <div className="center"><div className="loader"/>Checking secure admin session…</div>;
-  if (!admin) return <main className="login-page"><div className="login-card"><div className="logo">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt=""/>:<Shield size={22}/>}</div><p className="eyebrow">{siteName.toUpperCase()} · PLATFORM</p><h1>Admin console</h1><p className="subtle">Sign in with the account configured as the platform administrator.</p>{denied && <div className="error-box"><ShieldAlert size={17}/><span>{loginError || "This account does not have global administrator access."}</span></div>}<form onSubmit={login}><label>Email<input name="email" type="email" autoComplete="username" required/></label><label>Password<input name="password" type="password" autoComplete="current-password" required/></label>{loginError && !denied && <div className="error-box">{loginError}</div>}<button className="primary wide" disabled={busy}>{busy ? "Signing in…" : "Sign in securely"}<ChevronRight size={16}/></button></form><p className="login-foot"><Shield size={14}/> Admin access is enforced by the API.</p></div></main>;
+  if (!admin) return <main className="login-page"><div className="login-card"><div className="logo">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt=""/>:<Shield size={22}/>}</div><p className="eyebrow">{siteName.toUpperCase()} · PLATFORM</p><h1>Admin console</h1><p className="subtle">Sign in with the Google account configured as the platform administrator.</p>{denied && <div className="error-box"><ShieldAlert size={17}/><span>{loginError || "This account does not have global administrator access."}</span></div>}<button type="button" className="admin-google-login" disabled={google===null} onClick={()=>google?window.location.assign(`${API}/api/v1/auth/google/start?admin=true`):setLoginError("Google sign-in is not connected yet. Configure the Google OAuth client and restart the API.")}><span className="admin-google-mark">G</span>Continue with Google</button>{google===false&&<p className="google-login-hint">Google sign-in is not configured.</p>}{loginError&&!denied&&<div className="error-box">{loginError}</div>}<p className="login-foot"><Shield size={14}/> Admin access is enforced by the API.</p></div></main>;
 
   const nav: { id: View; icon: LucideIcon }[] = [{ id: "overview", icon: LayoutDashboard }, { id: "users", icon: Users }, { id: "agents", icon: Bot }, { id: "conversations", icon: MessageSquareText }, { id: "tickets", icon: CircleHelp }, { id: "payments", icon: CreditCard }, { id: "plans", icon: Zap }, { id: "chat-templates", icon: MessageSquareText }, { id: "langfuse", icon: Sparkles }, { id: "documentation", icon: BookOpen }, { id: "activity", icon: Activity }, { id: "site", icon: Settings2 }];
   const pages = Math.max(1, Math.ceil((rows?.total || 0) / (rows?.limit || 25)));
@@ -273,7 +263,7 @@ export default function AdminConsole() {
         {ticketNotice && <div className="ticket-notice"><CircleHelp size={16}/><span>{ticketNotice}</span><button onClick={()=>setTicketNotice("")} aria-label="Dismiss notification"><X size={14}/></button></div>}
         {error && <div className="error-banner"><CircleHelp size={16}/>{error}<button onClick={() => setError("")}><X size={15}/></button></div>}
         {view === "overview" && <Overview data={overview} activity={rows}/>}
-        {view === "users" && <><PageHeading eyebrow="ACCOUNT OPERATIONS" title="Users" description="Review accounts, adjust plan access, and suspend or restore sign-in."/><SearchBar query={query} setQuery={setQuery} onSearch={() => { setSubmittedQuery(query.trim()); setPage(1); }}/><UserTable rows={rows?.items || []} planOptions={rows?.plan_options||[]} busy={busy} onUpdate={updateUser}/><Pager page={page} pages={pages} setPage={setPage} total={rows?.total || 0}/></>}
+        {view === "users" && <><PageHeading eyebrow="ACCOUNT OPERATIONS" title="Users" description="Review accounts, adjust plan access, and suspend or restore sign-in."/><SearchBar query={query} setQuery={setQuery} onSearch={() => { setSubmittedQuery(query.trim()); setPage(1); }}/><UserTable rows={rows?.items || []} planOptions={rows?.plan_options||[]} busy={busy} onUpdate={updateUser} onView={(u) => setViewedUserId(u.id)}/><Pager page={page} pages={pages} setPage={setPage} total={rows?.total || 0}/></>}
         {view === "agents" && <><PageHeading eyebrow="CONTENT OPERATIONS" title="Agents" description="View agents across every workspace and manage publication status."/><SearchBar query={query} setQuery={setQuery} onSearch={() => { setSubmittedQuery(query.trim()); setPage(1); }}/><AgentTable rows={rows?.items || []} busy={busy} onToggle={toggleAgent}/><Pager page={page} pages={pages} setPage={setPage} total={rows?.total || 0}/></>}
         {view === "conversations" && <><PageHeading eyebrow="SUPPORT OVERSIGHT" title="Conversations" description="Inspect recent visitor conversations across all agents."/><SearchBar query={query} setQuery={setQuery} onSearch={() => { setSubmittedQuery(query.trim()); setPage(1); }}/><ConversationTable rows={rows?.items || []} onOpen={openConversation}/><Pager page={page} pages={pages} setPage={setPage} total={rows?.total || 0}/></>}
         {view === "tickets" && <><PageHeading eyebrow="CUSTOMER CARE" title="Support tickets" description="Reply to customer requests, update ticket status, and follow the full message thread."/><SearchBar query={query} setQuery={setQuery} onSearch={() => { setSubmittedQuery(query.trim()); setPage(1); }}/><SupportTicketTable rows={rows?.items || []} onOpen={openSupportTicket}/><Pager page={page} pages={pages} setPage={setPage} total={rows?.total || 0}/></>}
@@ -286,6 +276,7 @@ export default function AdminConsole() {
         {view === "site" && <><PageHeading eyebrow="BRAND IDENTITY" title="Site settings" description="Set the application name and logo shown throughout the website and admin panel."/><form className="panel site-settings-panel" onSubmit={saveSiteSettings}><label>Application name<input value={siteName} onChange={event=>setSiteName(event.target.value)} maxLength={80} required/></label><div className="site-logo-settings"><div><h2>Application logo</h2><p>Upload an image and we’ll center-crop it to a fixed 256 × 256 PNG for consistent display.</p></div><div className="site-logo-preview">{siteSettings.logo_url?<img src={siteSettings.logo_url} alt="Application logo preview"/>:<span><ImageIcon size={25}/></span>}</div></div><label className="site-logo-upload secondary"><Upload size={15}/>{siteLogoUploading?"Cropping and uploading…":"Choose logo image"}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={siteLogoUploading||busy} onChange={event=>{const file=event.currentTarget.files?.[0];if(file)void uploadSiteLogo(file);event.currentTarget.value="";}}/></label><small className="site-logo-help">PNG, JPG, WEBP, or GIF · maximum 10 MB · center-cropped to 256 × 256</small>{siteSettings.has_logo&&!siteLogoChanged&&<button type="button" className="danger-outline site-logo-remove" onClick={()=>{setSiteSettings(current=>({...current,has_logo:false,logo_url:""}));setSiteLogoChanged(true);}}>Remove logo</button>}{siteLogoChanged&&<p className="site-logo-pending">Logo removal will take effect when you save.</p>}<div className="site-settings-footer"><span>Branding changes appear across the public site after the next page load.</span><button className="primary" disabled={busy||siteLogoUploading}>Save site settings</button></div></form></>}
       </div>
     </main>
+    {viewedUserId && <UserDetailModal userId={viewedUserId} onClose={() => setViewedUserId(null)} onUpdated={async () => { await Promise.all([refreshRows("users", page, submittedQuery), refreshOverview()]); }} onOpenConversation={openConversation} onOpenTicket={openSupportTicket} />}
     {transcript && <div className="modal-backdrop" onClick={() => setTranscript(null)}><section className="transcript-modal" onClick={e => e.stopPropagation()}><header><div><p className="eyebrow">CONVERSATION TRANSCRIPT</p><h2>{transcript.title}</h2></div><button className="icon-button" onClick={() => setTranscript(null)}><X size={18}/></button></header><div className="transcript-body">{transcript.messages.map((m:any)=><article key={m.id} className={`chat-line ${m.role}`}><small>{m.role === "user" ? "Visitor" : "Agent"} · {date(m.created_at)}</small><p>{m.content}</p>{m.citations?.length > 0 && <details><summary>{m.citations.length} citations</summary>{m.citations.map((c:any,i:number)=><p className="citation" key={i}>{c.source}: {c.excerpt}</p>)}</details>}</article>)}</div></section></div>}
     {supportThread && <div className="modal-backdrop" onClick={() => setSupportThread(null)}><section className="support-admin-modal" onClick={e => e.stopPropagation()}><header><div><p className="eyebrow">SUPPORT TICKET · {supportThread.id.slice(0,8).toUpperCase()}</p><h2>{supportThread.subject}</h2><p className="subtle">{supportThread.user_name} · {supportThread.user_email}</p></div><button className="icon-button" onClick={() => setSupportThread(null)}><X size={18}/></button></header><div className="support-admin-controls"><label>Status<select disabled={busy} value={supportThread.status} onChange={e=>void changeSupportStatus(e.target.value)}><option value="open">Open</option><option value="in_progress">In progress</option><option value="waiting_on_user">Waiting on user</option><option value="resolved">Resolved</option><option value="closed">Closed</option></select></label><span>Updated {date(supportThread.updated_at)}</span></div><div className="support-admin-messages">{supportThread.messages.map((m:any)=><article key={m.id} className={`admin-ticket-message ${m.author_role}`}><small>{m.author_name} · {date(m.created_at)}</small><SupportMessageView text={m.body}/></article>)}</div><form className="support-admin-reply" onSubmit={sendSupportReply}><SupportEditor value={supportReply} onChange={setSupportReply} maxLength={10000} rows={3} placeholder="Reply to the customer…"/><button className="primary" disabled={busy}><MessageSquareText size={15}/>{busy?"Sending…":"Send reply"}</button></form></section></div>}
   </div>;
@@ -298,7 +289,7 @@ function Metric({ icon, label, value, detail }: { icon: ReactNode; label: string
 function Overview({ data, activity }: { data: any; activity: any }) {
   return <><PageHeading eyebrow="PLATFORM OVERVIEW" title="Dashboard" description="A live view of accounts, agents, usage, and platform integrations."/>{!data ? <div className="loading-card">Loading platform metrics…</div> : <><div className="welcome"><div><span>ADMINISTRATOR WORKSPACE</span><h2>Welcome back, let’s keep things running.</h2><p>Platform-wide visibility and account controls.</p></div><div className="welcome-icon"><Shield size={34}/></div></div><div className="metrics-grid"><Metric icon={<Users size={17}/>} label="Total users" value={data.users} detail={`${data.active_users} active · ${data.suspended_users} suspended`}/><Metric icon={<Bot size={17}/>} label="Total agents" value={data.agents} detail={`${data.published_agents} published`}/><Metric icon={<MessageSquareText size={17}/>} label="Knowledge sources" value={data.documents} detail="Across all workspaces"/><Metric icon={<Activity size={17}/>} label="Visitor messages" value={data.messages} detail="All time"/></div><div className="overview-grid-two"><section className="panel"><div className="panel-heading"><div><h2>Plan distribution</h2><p>Accounts by current plan</p></div></div><div className="plan-list">{Object.entries(data.plans||{}).map(([plan,count]:[string,any])=><div key={plan}><span className={`plan-dot ${plan}`}/><span className="capitalize">{plan}</span><strong>{count}</strong></div>)}</div></section><section className="panel"><div className="panel-heading"><div><h2>Integrations</h2><p>Configured service connections</p></div><Shield size={18}/></div><div className="integration-list">{Object.entries(data.integrations || {}).map(([name, enabled])=><div key={name}><span>{name}</span><Badge tone={enabled ? "green" : "gray"}>{enabled ? "Configured" : "Not configured"}</Badge></div>)}</div></section></div><section className="panel activity-panel"><div className="panel-heading"><div><h2>Recent administrator actions</h2><p>Latest account and agent changes</p></div><span className="subtle small-text">See Admin activity for the full log</span></div><AuditTable rows={activity?.items?.slice(0, 5) || []}/></section></>}</>;
 }
-function UserTable({ rows, planOptions, busy, onUpdate }: { rows: AdminUser[]; planOptions: {slug:string;name:string}[]; busy: boolean; onUpdate: (u: AdminUser, p: {plan?:string;is_active?:boolean}) => void }) { return <div className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>USER</th><th>PLAN</th><th>AGENTS</th><th>MESSAGES</th><th>STATUS</th><th>JOINED</th><th>ACCOUNT ACTIONS</th></tr></thead><tbody>{rows.map(u=><tr key={u.id}><td><strong>{u.name}</strong><small>{u.email}</small></td><td><select aria-label={`Plan for ${u.email}`} disabled={busy} value={u.plan} onChange={e=>onUpdate(u,{plan:e.target.value})}>{(planOptions.length?planOptions:[{slug:'free',name:'Free'},{slug:'pro',name:'Pro'},{slug:'team',name:'Team'}]).map(p=><option key={p.slug} value={p.slug}>{p.name}</option>)}</select>{u.has_subscription && <small className="table-note">Provider may resync plan</small>}</td><td>{u.agent_count}</td><td>{u.message_count}</td><td><Badge tone={u.is_active?"green":"red"}>{u.is_active?"Active":"Suspended"}</Badge></td><td>{date(u.created_at)}</td><td><button className={u.is_active?"danger-outline":"success-outline"} disabled={busy} onClick={()=>onUpdate(u,{is_active:!u.is_active})}>{u.is_active?"Suspend":"Reactivate"}</button></td></tr>)}</tbody></table>{!rows.length&&<Empty text="No user accounts match this search."/>}</div></div>; }
+function UserTable({ rows, planOptions, busy, onUpdate, onView }: { rows: AdminUser[]; planOptions: {slug:string;name:string}[]; busy: boolean; onUpdate: (u: AdminUser, p: {plan?:string;is_active?:boolean}) => void; onView: (u: AdminUser) => void }) { return <div className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>USER</th><th>PLAN</th><th>AGENTS</th><th>MESSAGES</th><th>STATUS</th><th>JOINED</th><th>ACCOUNT ACTIONS</th></tr></thead><tbody>{rows.map(u=><tr key={u.id}><td><strong>{u.name}</strong><small>{u.email}</small></td><td><select aria-label={`Plan for ${u.email}`} disabled={busy} value={u.plan} onChange={e=>onUpdate(u,{plan:e.target.value})}>{(planOptions.length?planOptions:[{slug:'free',name:'Free'},{slug:'pro',name:'Pro'},{slug:'team',name:'Team'}]).map(p=><option key={p.slug} value={p.slug}>{p.name}</option>)}</select>{u.has_subscription && <small className="table-note">Provider may resync plan</small>}</td><td>{u.agent_count}</td><td>{u.message_count}</td><td><Badge tone={u.is_active?"green":"red"}>{u.is_active?"Active":"Suspended"}</Badge></td><td>{date(u.created_at)}</td><td><div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}><button type="button" className="secondary" onClick={()=>onView(u)}><Eye size={14}/>View</button><button className={u.is_active?"danger-outline":"success-outline"} disabled={busy} onClick={()=>onUpdate(u,{is_active:!u.is_active})}>{u.is_active?"Suspend":"Reactivate"}</button></div></td></tr>)}</tbody></table>{!rows.length&&<Empty text="No user accounts match this search."/>}</div></div>; }
 function AgentTable({ rows, busy, onToggle }: { rows: AdminAgent[]; busy: boolean; onToggle: (a: AdminAgent) => void }) { return <div className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>AGENT</th><th>OWNER</th><th>SOURCES</th><th>MESSAGES</th><th>STATUS</th><th>CREATED</th><th>ACTION</th></tr></thead><tbody>{rows.map(a=><tr key={a.id}><td><strong>{a.name}</strong><small className="mono">{a.id}</small></td><td>{a.owner_email}</td><td>{a.documents}</td><td>{a.messages}</td><td><Badge tone={a.published?"green":"amber"}>{a.published?"Published":"Draft"}</Badge></td><td>{date(a.created_at)}</td><td><button className={a.published?"danger-outline":"success-outline"} disabled={busy} onClick={()=>onToggle(a)}>{a.published?"Unpublish":"Publish"}</button></td></tr>)}</tbody></table>{!rows.length&&<Empty text="No agents match this search."/>}</div></div>; }
 function ConversationTable({ rows, onOpen }: { rows: any[]; onOpen: (id:string,title:string)=>void }) { return <div className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>AGENT / OWNER</th><th>LAST MESSAGE</th><th>MESSAGES</th><th>STARTED</th><th/></tr></thead><tbody>{rows.map(c=><tr key={c.id}><td><strong>{c.agent_name}</strong><small>{c.owner_email}</small></td><td className="message-preview">{c.last_message}</td><td>{c.message_count}</td><td>{date(c.created_at)}</td><td><button className="secondary" onClick={()=>onOpen(c.id,c.agent_name)}>View transcript<ChevronRight size={14}/></button></td></tr>)}</tbody></table>{!rows.length&&<Empty text="No conversations found."/>}</div></div>; }
 function SupportTicketTable({ rows, onOpen }: { rows: any[]; onOpen: (id:string)=>void }) { return <div className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>TICKET</th><th>USER</th><th>LAST REPLY</th><th>STATUS</th><th>UPDATED</th><th/></tr></thead><tbody>{rows.map(t=><tr key={t.id} className={t.admin_unread?"ticket-unread":""}><td><strong>{t.subject}</strong><small className="mono">{t.id.slice(0,8)}</small></td><td><strong>{t.user_name}</strong><small>{t.user_email}</small></td><td className="message-preview">{t.last_message}</td><td><Badge tone={t.status==="open"?"amber":t.status==="resolved"||t.status==="closed"?"green":"gray"}>{t.status.replaceAll("_"," ")}</Badge></td><td>{date(t.updated_at)}</td><td><button className="secondary" onClick={()=>onOpen(t.id)}>Open ticket<ChevronRight size={14}/></button></td></tr>)}</tbody></table>{!rows.length&&<Empty text="No support tickets found."/>}</div></div>; }

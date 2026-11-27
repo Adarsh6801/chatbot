@@ -91,7 +91,7 @@ Copy `.env.example` to `.env` at the repository root. The API reads this file on
 | --- | --- |
 | `DATABASE_URL` | SQLite by default; production can use `postgresql+psycopg://user:password@host/db` |
 | `WEB_ORIGIN` | Exact allowed dashboard origin; used for CORS and origin checks |
-| `ADMIN_WEB_ORIGIN`, `ADMIN_USER_ID` | Separate admin console origin and the one account authorized for global administration |
+| `ADMIN_WEB_ORIGIN`, `ADMIN_USER_ID` | Admin console origin (also the Google sign-in return URL) and the one account authorized for global administration |
 | `PUBLIC_WEB_URL` | Hosted chat base URL and billing return URLs |
 | `APP_ENV=production` | Enables Secure cookies; use HTTPS |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | Enable live language-model generation |

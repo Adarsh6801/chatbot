@@ -16,12 +16,12 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 from .config import WEB_ORIGIN, PUBLIC_WEB_URL, PRODUCTION
-from .database import Base, engine, Session, get_db, User, LoginSession, Bot, AgentVersion, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, WorkflowApiLog, BotActivityLog, AppSetting, TokenUsage, now
+from .database import Base, engine, Session, get_db, User, LoginSession, Bot, AgentVersion, Document, Chunk, Conversation, Message, Flag, EvalRun, ApiKey, Workflow, WorkflowApiLog, BotActivityLog, AppSetting, TokenUsage, SupportTicket, SupportTicketMessage, Payment, BillingAttempt, AdminAudit, now
 from .chat_templates import get_templates, resolve_agent_theme, normalize_customization
 from .security import current_user, owned_bot, password_hash, verify_password, digest, rate_limit
 from .ingestion import ingest, parse_file, eval_bot, MAX_BYTES
 from .rag import retrieve, rerank, generate, generate_stream, INJECTION
-from .providers import hybrid_search, export_trace, store_raw, store_widget_logo, read_widget_logo, read_site_logo
+from .providers import hybrid_search, export_trace, store_raw, store_widget_logo, read_widget_logo, read_site_logo, delete_widget_logo
 from .workers import dispatch
 from sqlalchemy import text, update
 
@@ -273,6 +273,84 @@ def profile(body:ProfileInput,db:DBSession=Depends(get_db),user=Depends(current_
     db.commit()
     return user_data(user)
 
+def _delete_bots_data(db: DBSession, bots: list[Bot], delete_token_usage: bool = False):
+    if not bots:
+        return
+    bot_ids = [b.id for b in bots]
+    for bot in bots:
+        for cfg in (bot.widget_config or {}, (bot.published_config or {}).get('widget_config') or {}):
+            logo = str(cfg.get('logo') or '')
+            if logo.startswith('s3://'):
+                try:
+                    delete_widget_logo(logo)
+                except Exception:
+                    logging.getLogger('agentforge').warning('Could not delete widget logo %s during bot cleanup', logo)
+    msg_ids = [row[0] for row in db.query(Message.id).filter(Message.bot_id.in_(bot_ids)).all()]
+    if msg_ids:
+        if delete_token_usage:
+            db.query(TokenUsage).filter(TokenUsage.message_id.in_(msg_ids)).delete(synchronize_session=False)
+        else:
+            db.query(TokenUsage).filter(TokenUsage.message_id.in_(msg_ids)).update({TokenUsage.message_id: None}, synchronize_session=False)
+    for model in (Message, WorkflowApiLog, BotActivityLog, Flag, EvalRun, Chunk, Document, Conversation, AgentVersion, Workflow):
+        db.query(model).filter(model.bot_id.in_(bot_ids)).delete(synchronize_session=False)
+    db.query(Bot).filter(Bot.id.in_(bot_ids)).delete(synchronize_session=False)
+
+def _cancel_remote_subscription(user: User):
+    log = logging.getLogger('agentforge')
+    try:
+        if user.billing_provider == 'stripe' and user.subscription_id and os.getenv('STRIPE_SECRET_KEY'):
+            import stripe
+            stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
+            stripe.Subscription.cancel(user.subscription_id)
+        elif user.billing_provider == 'razorpay' and user.razorpay_subscription_id and os.getenv('RAZORPAY_KEY_ID') and os.getenv('RAZORPAY_KEY_SECRET'):
+            httpx.post(
+                f'https://api.razorpay.com/v1/subscriptions/{user.razorpay_subscription_id}/cancel',
+                auth=(os.getenv('RAZORPAY_KEY_ID'), os.getenv('RAZORPAY_KEY_SECRET')),
+                json={'cancel_at_cycle_end': False},
+                timeout=10,
+            )
+    except Exception:
+        log.warning('Could not cancel remote subscription during account deletion for user %s', user.id)
+
+@app.get('/api/v1/account/deletion-summary')
+def account_deletion_summary(db: DBSession = Depends(get_db), user=Depends(current_user)):
+    bots = db.query(Bot).filter_by(user_id=user.id).order_by(Bot.created_at.desc()).all()
+    published_bots = sum(1 for b in bots if b.published)
+    return {
+        'plan': user.plan,
+        'billing_provider': user.billing_provider,
+        'has_active_subscription': has_active_subscription(user),
+        'has_paid_plan': user.plan != 'free',
+        'has_pending_subscription': bool(user.subscription_id or user.razorpay_subscription_id),
+        'total_bots': len(bots),
+        'published_bots': published_bots,
+        'active_bots': published_bots,
+        'draft_bots': len(bots) - published_bots,
+        'bots': [{'id': b.id, 'name': b.name, 'published': bool(b.published)} for b in bots],
+    }
+
+@app.delete('/api/v1/account')
+def delete_account(response: Response, db: DBSession = Depends(get_db), user=Depends(current_user)):
+    _cancel_remote_subscription(user)
+    bots = db.query(Bot).filter_by(user_id=user.id).all()
+    _delete_bots_data(db, bots, delete_token_usage=True)
+    db.query(AgentVersion).filter_by(created_by=user.id).delete(synchronize_session=False)
+    db.query(TokenUsage).filter_by(user_id=user.id).delete(synchronize_session=False)
+    ticket_ids = [row[0] for row in db.query(SupportTicket.id).filter_by(user_id=user.id).all()]
+    if ticket_ids:
+        db.query(SupportTicketMessage).filter(SupportTicketMessage.ticket_id.in_(ticket_ids)).delete(synchronize_session=False)
+    db.query(SupportTicketMessage).filter_by(author_id=user.id).delete(synchronize_session=False)
+    db.query(SupportTicket).filter_by(user_id=user.id).delete(synchronize_session=False)
+    db.query(Payment).filter_by(user_id=user.id).delete(synchronize_session=False)
+    db.query(BillingAttempt).filter_by(user_id=user.id).delete(synchronize_session=False)
+    db.query(ApiKey).filter_by(user_id=user.id).delete(synchronize_session=False)
+    db.query(LoginSession).filter_by(user_id=user.id).delete(synchronize_session=False)
+    db.query(AdminAudit).filter_by(actor_id=user.id).delete(synchronize_session=False)
+    db.delete(user)
+    db.commit()
+    response.delete_cookie('agentforge_session', path='/')
+    return {'ok': True}
+
 @app.get('/api/v1/bots')
 def list_bots(db: DBSession = Depends(get_db), user=Depends(current_user)):
     return [bot_data(bot, db) for bot in db.query(Bot).filter_by(user_id=user.id).order_by(Bot.created_at.desc()).all()]
@@ -391,8 +469,7 @@ def restore_agent_version(bot_id: str, version_id: str, db: DBSession = Depends(
 @app.delete('/api/v1/bots/{bot_id}')
 def delete_bot(bot_id: str, db: DBSession = Depends(get_db), user=Depends(current_user)):
     bot = owned_bot(db, bot_id, user)
-    for model in (Message, Flag, EvalRun, Chunk, Document, WorkflowApiLog, BotActivityLog, Conversation, AgentVersion, Workflow): db.query(model).filter_by(bot_id=bot.id).delete()
-    db.delete(bot)
+    _delete_bots_data(db, [bot], delete_token_usage=False)
     db.commit()
     return {'ok': True}
 
