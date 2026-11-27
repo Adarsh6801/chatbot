@@ -3,6 +3,23 @@ from sqlalchemy import inspect, text
 from .database import engine, Base, Session, Bot, AgentVersion, AppSetting, DocumentationCategory, DocumentationPage, now
 
 def migrate():
+    lock_conn = None
+    if engine.dialect.name == 'postgresql':
+        lock_conn = engine.connect()
+        lock_conn.execute(text('SELECT pg_advisory_lock(48151623)'))
+        lock_conn.commit()
+    try:
+        _run_migrations()
+    finally:
+        if lock_conn is not None:
+            try:
+                lock_conn.execute(text('SELECT pg_advisory_unlock(48151623)'))
+                lock_conn.commit()
+            finally:
+                lock_conn.close()
+
+
+def _run_migrations():
     with engine.begin() as connection:
         if engine.dialect.name == 'postgresql': connection.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
         connection.execute(text('CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY)'))
