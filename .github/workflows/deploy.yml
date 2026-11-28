@@ -2,7 +2,7 @@ name: Deploy to AWS EC2
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 concurrency:
@@ -21,6 +21,8 @@ jobs:
           cache-dependency-path: services/api/requirements.txt
       - run: pip install -r services/api/requirements.txt
       - run: python -m pytest services/api/tests/test_workflow.py -q
+        env:
+          DATABASE_URL: sqlite:///:memory:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -30,7 +32,7 @@ jobs:
   deploy:
     needs: verify
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     steps:
       - name: Deploy over SSH to existing AWS EC2 instance
         env:
@@ -38,12 +40,14 @@ jobs:
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+          DEPLOY_BRANCH: ${{ github.ref_name }}
         run: |
           if [ -z "$EC2_HOST" ] || [ -z "$EC2_USER" ] || [ -z "$EC2_SSH_KEY" ]; then
             echo "Set EC2_HOST, EC2_USER, and EC2_SSH_KEY in GitHub Repository Secrets to enable automated deployment."
             exit 1
           fi
           APP_DIR="${EC2_APP_DIR:-/opt/chatbot}"
+          BRANCH="${DEPLOY_BRANCH:-master}"
           mkdir -p ~/.ssh
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
@@ -52,16 +56,23 @@ jobs:
           ssh -i ~/.ssh/deploy_key "$EC2_USER@$EC2_HOST" "bash -s" <<EOF
             set -euo pipefail
             cd "$APP_DIR"
-            git fetch origin main
-            git checkout main
-            git reset --hard origin/main
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+            git reset --hard "origin/$BRANCH"
             docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
-            for i in \$(seq 1 20); do
+            HEALTHY=0
+            for i in \$(seq 1 25); do
               if docker compose -f docker-compose.prod.yml exec -T api python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" >/dev/null 2>&1; then
                 echo "API healthy!"
+                HEALTHY=1
                 break
               fi
               sleep 3
             done
+            if [ "\$HEALTHY" -ne 1 ]; then
+              echo "API failed healthcheck after deploy!"
+              docker compose -f docker-compose.prod.yml logs --tail=60 api
+              exit 1
+            fi
             docker image prune -f
           EOF
